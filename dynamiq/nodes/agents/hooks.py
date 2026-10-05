@@ -130,11 +130,7 @@ class ToolHook(HookBase):
                 data, parsed = loaded, True
 
         transformed = Node.transform({"content": data}, self.output_transformer)
-        if not isinstance(transformed, dict) or "content" not in transformed:
-            logger.warning(f"Tool hook for '{tool_name}': output_transformer produced no 'content'; result kept.")
-            return tool_result
-
-        content = transformed["content"]
+        content = transformed["content"] if isinstance(transformed, dict) and "content" in transformed else transformed
         if content is None:
             logger.warning(f"Tool hook for '{tool_name}': output_transformer matched nothing; 'content' is None.")
         if parsed and not isinstance(content, str) and content is not None:

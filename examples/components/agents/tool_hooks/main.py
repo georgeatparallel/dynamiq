@@ -1,13 +1,10 @@
 """Example: agent with before/after tool hooks, loaded from a YAML DAG, with tracing.
 
-Needs OPENAI_API_KEY (read from the shell or from the repo's .env; .env wins over stale shell values). Run:  python examples/components/agents/tool_hooks/main.py ["your question"]
-
 Expected: the model only ever sees the customer's public profile (never the internal notes), and its attempt to
 delete the customer is blocked with the hook's message.
 
 Tracing: hook activity is recorded on the agent run as `metadata["tool_hooks"]` / `metadata["model_hooks"]`
-(rewrites, blocks, errors). It is printed at the end; set DYNAMIQ_TRACE_ACCESS_KEY (and optionally DYNAMIQ_TRACE_BASE_URL) to also
-send the trace to the Dynamiq UI, where it shows in the agent run's metadata.
+(rewrites, blocks, errors).
 """
 
 import os
@@ -36,7 +33,8 @@ def main():
 
     agent = next(n for n in wf.flow.nodes if isinstance(n, Agent))
     print(
-        f"Loaded agent '{agent.name}' with {len(agent.tool_hooks)} tool hook(s), {len(agent.model_hooks)} model hook(s)\n"
+        f"Loaded agent '{agent.name}' with {len(agent.tool_hooks)} "
+        f"tool hook(s), {len(agent.model_hooks)} model hook(s)\n"
     )
 
     trace_key = os.getenv("DYNAMIQ_TRACE_ACCESS_KEY")

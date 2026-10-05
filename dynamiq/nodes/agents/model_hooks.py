@@ -214,7 +214,6 @@ class RegexRedactModelHook(_RegexRules):
 
 class RegexGuardModelHook(_RegexRules):
     """Block the call (input) or discard the reply (output) when any regex matches. YAML-only guardrail.
-
     ``system`` messages are not scanned.
     """
 
@@ -231,7 +230,8 @@ class RegexGuardModelHook(_RegexRules):
     def should_block(self, messages):
         if not self._checks_input() or not self.block_if_matches:
             return False
-        return any(self._matches(message_text(m)) for m in messages if m.role != MessageRole.SYSTEM)
+        last_user = next((m for m in reversed(messages) if m.role == MessageRole.USER), None)
+        return last_user is not None and self._matches(message_text(last_user))
 
     def should_block_output(self, output):
         content = output.get("content")
