@@ -33,6 +33,7 @@ from dynamiq.nodes.agents.exceptions import (
     AgentUnknownToolException,
     HookAnswerException,
     HookBlockedException,
+    HookStopException,
     InvalidActionException,
     ToolBlockedException,
     ToolExecutionException,
@@ -999,10 +1000,13 @@ class Agent(AgentIterativeCheckpointMixin, Node):
                 self._current_call_context = None
                 self._clear_todos_file()
 
+            # What memory keeps: the answer before a hook put real values back (``pii`` ``restore_in_output``).
+            memory_answer = current_hook_ctx.get().memory_answer
+            memory_result = memory_answer[0] if memory_answer and not hook_blocked else result
             # A run blocked on its input never built a prompt: nothing is saved.
             if use_memory and not (hook_blocked and hook_blocked.point == HookPoint.ON_INPUT.value):
                 try:
-                    self._save_history_to_memory(custom_metadata, final_output=result)
+                    self._save_history_to_memory(custom_metadata, final_output=memory_result)
                 except Exception as save_error:
                     logger.error(
                         "Agent %s - %s: failed to save history to memory: %s",
@@ -1018,7 +1022,8 @@ class Agent(AgentIterativeCheckpointMixin, Node):
             if hook_blocked is not None:
                 execution_result["blocked_by"] = hook_blocked.hook
 
-            requested_paths = getattr(self, "_requested_output_files", None)
+            # A blocked run returns no files: the field holds the previous run's paths, or those of a vetoed answer.
+            requested_paths = None if hook_blocked else getattr(self, "_requested_output_files", None)
 
             if self.file_store_backend and requested_paths:
                 try:
@@ -2171,6 +2176,9 @@ class Agent(AgentIterativeCheckpointMixin, Node):
                         ).value
                         error_message = failed.error if failed.error is not None else str(failed.content)
                     raise ToolExecutionException(error_message)
+                elif issubclass(tool_result.error.type, HookStopException):
+                    # A hook stopped the sub-agent: the parent run stops too, and is never retried.
+                    raise HookStopException(error_message)
                 else:
                     raise ValueError(error_message)
 

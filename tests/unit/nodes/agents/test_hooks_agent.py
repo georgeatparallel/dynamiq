@@ -1,6 +1,7 @@
 """Hooks inside a real agent loop, in every inference mode."""
 
 import json
+import re
 import threading
 from typing import ClassVar
 
@@ -1067,3 +1068,75 @@ def test_inherited_hooks_see_the_callers_user_id_inside_a_sub_agent():
     with scripted(child, InferenceMode.STRUCTURED_OUTPUT, [tool_step("search", query="c"), final_step("done")]):
         run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, steps, input_extra={"user_id": "alice"})
     assert [args["query"] for args in tool_inputs("search")] == ["c"]
+
+
+# --- review of dff416f ---------------------------------------------------------------------------------------------
+
+
+@modes
+def test_memory_keeps_placeholders_when_the_answer_is_restored_for_the_caller(mode):
+    from dynamiq.memory import Memory
+    from dynamiq.memory.backends import InMemory
+    from dynamiq.memory.memory import MemorySaveMode
+
+    memory = Memory(backend=InMemory(), save_mode=MemorySaveMode.INPUT_OUTPUT)
+    agent = build_agent([PIIHook(restore_in_output=True)], memory=memory)
+    result, _ = run_scripted(
+        agent,
+        mode,
+        [final_step("noted <EMAIL_1>")],
+        question="my mail is ann@x.com",
+        input_extra={"user_id": "u1", "session_id": "s1"},
+    )
+    assert result.output["content"] == "noted ann@x.com"  # the caller gets the real value
+    stored = " ".join(str(m.content) for m in memory.get_all())
+    assert "<EMAIL_1>" in stored and "ann@x.com" not in stored
+
+
+def test_a_blocked_run_returns_no_files_from_an_earlier_run():
+    from dynamiq.storages.file.in_memory import InMemoryFileStore
+    from dynamiq.nodes.agents.base import FileStoreConfig
+
+    store = InMemoryFileStore()
+    store.store("report.txt", b"someone else's data")
+    agent = build_agent(
+        [RegexHook(patterns=[r"forbidden"], on=["input"], on_violation=BlockAs.ANSWER, message="no")],
+        file_store=FileStoreConfig(enabled=True, backend=store),
+    )
+    agent._requested_output_files = ["report.txt"]  # left over from the previous run
+    with scripted(agent, InferenceMode.STRUCTURED_OUTPUT, [final_step("x")]):
+        result = agent.run(input_data={"input": "forbidden"})
+    assert result.output["blocked"] is True and "files" not in result.output
+
+
+@modes
+def test_a_hook_stop_in_a_sub_agent_is_not_retried_by_the_parent(mode):
+    from dynamiq.nodes.node import ErrorHandling
+
+    child = build_agent(
+        [RegexHook(patterns=[r"SECRET\d+"], on=["output"], on_violation=BlockAs.FAIL, message="stop", inherit=True)],
+        tools=[],
+        name="Researcher",
+        id="child",
+    )
+    parent = build_agent(
+        [],
+        tools=[SubAgentTool(agent=child, name="Researcher", description="researches")],
+        delegation_allowed=True,
+        error_handling=ErrorHandling(max_retries=2, retry_interval_seconds=0),
+    )
+    with scripted(child, mode, [final_step("found SECRET1")]):
+        result, recorder = run_scripted(parent, mode, [tool_step("Researcher", input="q"), final_step("ok")])
+    assert result.status == RunnableStatus.FAILURE
+    assert recorder.calls == 1  # the parent run was not started again
+
+
+def test_the_live_filter_keeps_the_text_after_a_match_longer_than_the_lookback():
+    from dynamiq.nodes.agents.hooks.core import LiveAnswerFilter
+
+    email = re.compile(r"[\w.]+@[\w.]+\.\w{2,}")
+    live = LiveAnswerFilter([lambda text: email.sub("<EMAIL_1>", text)], lookback=8)
+    text = "Contact: john.doe.smith@example.com thanks a lot for that."
+    streamed = "".join(live.feed(text[i : i + 3]) for i in range(0, len(text), 3)) + live.finish()
+    assert streamed.endswith(" thanks a lot for that.")
+    assert streamed.startswith("Contact: ")

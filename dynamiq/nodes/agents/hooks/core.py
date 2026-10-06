@@ -177,6 +177,7 @@ class HookContext:
     hook_key: str = ""
     config: RunnableConfig | None = None
     hooks: list[tuple[str, "Hook"]] = field(default_factory=list)
+    memory_answer: list = field(default_factory=list)
 
     def for_call(self, **changes) -> "HookContext":
         """A view for one call that shares ``state`` and ``lock`` with the run context."""
@@ -364,9 +365,24 @@ class LiveAnswerFilter:
             text = step(text)
         return text
 
+    def _resync(self, masked: str) -> None:
+        """A match longer than the lookback: part of it went out raw before it was recognised. Count the masked
+        replacement as sent too, so the text after the match still streams (the raw part is the documented leak)."""
+        if masked.startswith(self.sent):
+            return
+        limit = min(len(self.raw), len(masked))
+        prefix = 0
+        while prefix < limit and masked[prefix] == self.sent[prefix : prefix + 1]:
+            prefix += 1
+        suffix = 0
+        while suffix < limit - prefix and masked[-1 - suffix] == self.raw[-1 - suffix]:
+            suffix += 1
+        self.sent = masked[: len(masked) - suffix]
+
     def feed(self, chunk: str) -> str:
         self.raw += chunk
         masked = self._masked()
+        self._resync(masked)
         safe = masked[: max(len(masked) - self.lookback, 0)]
         if not safe.startswith(self.sent):
             return ""
@@ -374,7 +390,9 @@ class LiveAnswerFilter:
         return out
 
     def finish(self) -> str:
-        out = self._masked()[len(self.sent) :]
+        masked = self._masked()
+        self._resync(masked)
+        out = masked[len(self.sent) :]
         self.raw = self.sent = ""
         return out
 

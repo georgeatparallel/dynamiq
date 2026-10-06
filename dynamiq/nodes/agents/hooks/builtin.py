@@ -583,6 +583,8 @@ class PIIHook(TextGuardHook):
             if isinstance(decision, Modify):
                 value = decision.value
         if self.restore_in_output:
+            # Memory keeps the placeholders: the real values must not come back through saved history.
+            ctx.memory_answer[:] = [value]
             value = map_strings(value, lambda text: self._restore(ctx, text, only_origin="input"))
         return Modify(value) if value != answer else ALLOW
 
