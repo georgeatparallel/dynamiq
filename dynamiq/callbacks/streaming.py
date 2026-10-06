@@ -354,11 +354,13 @@ class AgentStreamingParserCallback(BaseStreamingCallbackHandler):
     with appropriate `step` labels (reasoning/answer) included.
     """
 
-    def __init__(self, agent: "Agent", config, loop_num: int, **kwargs):
+    def __init__(self, agent: "Agent", config, loop_num: int, suppress_answer: bool = False, **kwargs):
         self.agent = agent
         self.config = config
         self.loop_num = loop_num
         self.kwargs = kwargs
+        # Set when an output hook may rewrite or veto the answer: the agent streams it once, after the hooks.
+        self.suppress_answer = suppress_answer
 
         self.accumulated_content: str = ""
 
@@ -678,6 +680,9 @@ class AgentStreamingParserCallback(BaseStreamingCallbackHandler):
             force (bool): If True, skip min_chunk_chars accumulation.
         """
         if not content:
+            return
+
+        if self.suppress_answer and step == StreamingState.ANSWER:
             return
 
         # Skip streaming if in FINAL mode and not in answer step

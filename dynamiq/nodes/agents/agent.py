@@ -10,7 +10,7 @@ from pydantic_core import from_json
 from dynamiq.callbacks import AgentStreamingParserCallback, StreamingQueueCallbackHandler
 from dynamiq.executors.context import ContextAwareThreadPoolExecutor
 from dynamiq.nodes.agents.base import Agent as BaseAgent
-from dynamiq.nodes.agents.base import _run_extra_tools, _shared_sandbox_tools
+from dynamiq.nodes.agents.base import _model_output_rewritten, _run_extra_tools, _shared_sandbox_tools
 from dynamiq.nodes.agents.components import parser, schema_generator
 from dynamiq.nodes.agents.components.history_manager import HistoryManagerMixin
 from dynamiq.nodes.agents.exceptions import (
@@ -21,9 +21,8 @@ from dynamiq.nodes.agents.exceptions import (
     ParsingError,
     RecoverableAgentException,
     TagNotFoundError,
-    ToolExecutionException,
+    ToolBlockedException,
 )
-from dynamiq.nodes.agents.hooks import apply_before_tool_hooks, check_tool_hooks_block
 from dynamiq.nodes.agents.prompts.manager import AgentPromptManager, ReactPromptConfig
 from dynamiq.nodes.agents.utils import (
     SummarizationConfig,
@@ -1263,6 +1262,7 @@ class Agent(HistoryManagerMixin, BaseAgent):
                 agent=self,
                 config=config,
                 loop_num=loop_num,
+                suppress_answer=self._buffers_final_answer(),
                 **kwargs,
             )
 
@@ -1323,18 +1323,6 @@ class Agent(HistoryManagerMixin, BaseAgent):
                     "these fields are not accessible to the agent (is_accessible_to_agent=False)."
                 )
 
-        # Hooks skip the context manager and sub-agent tools.
-        use_hooks = bool(self.tool_hooks) and not isinstance(tool, (ContextManagerTool, SubAgentTool))
-        hook_error: ToolExecutionException | None = None
-        if use_hooks:
-            hook_trace: list[dict] = []
-            try:
-                action_input = apply_before_tool_hooks(self.tool_hooks, tool.name, action_input, hook_trace)
-            except ToolExecutionException as e:
-                hook_error = e  # re-raised inside the try below, so it is streamed and returned as an observation
-            finally:
-                self._emit_tool_hook_trace(hook_trace, config, **kwargs)
-
         tool_run_id = tool_run_id or self._streaming_tool_run_id or generate_uuid()
         self._streaming_tool_run_id = None
         self._streaming_tool_run_ids = []
@@ -1359,14 +1347,6 @@ class Agent(HistoryManagerMixin, BaseAgent):
         )
         try:
             check_cancellation(config)
-            if hook_error:
-                raise hook_error
-            if use_hooks:
-                hook_trace = []
-                try:
-                    check_tool_hooks_block(self.tool_hooks, tool.name, action_input, hook_trace)
-                finally:
-                    self._emit_tool_hook_trace(hook_trace, config, **kwargs)
             if isinstance(tool, ContextManagerTool):
                 tool_result = None
                 to_summarize, to_preserve = self._split_history()
@@ -1443,7 +1423,7 @@ class Agent(HistoryManagerMixin, BaseAgent):
                     config,
                     **kwargs,
                 )
-                if self.streaming.enabled:
+                if self.streaming.enabled and not self._buffers_final_answer():
                     self.stream_content(
                         content=tool_result,
                         source=tool.name,
@@ -1478,6 +1458,26 @@ class Agent(HistoryManagerMixin, BaseAgent):
             )
 
             return tool_result, tool_files, False, True, dependency
+
+        except ToolBlockedException as e:
+            # A hook refused the call: reported as a skip with `blocked_by`, not as a failed tool call.
+            self._stream_agent_event(
+                AgentToolResultEventMessageData(
+                    tool_run_id=tool_run_id,
+                    name=tool.name,
+                    tool=tool_data,
+                    input=action_input,
+                    result=str(e),
+                    files=[],
+                    loop_num=loop_num,
+                    output={"blocked": True, "blocked_by": e.hook},
+                    status=RunnableStatus.SKIP,
+                ),
+                "tool",
+                config,
+                **kwargs,
+            )
+            return str(e), [], False, False, None
 
         except RecoverableAgentException as e:
             # Stream error result with the same tool_run_id used for reasoning
@@ -1833,7 +1833,7 @@ class Agent(HistoryManagerMixin, BaseAgent):
 
         check_cancellation(config)
 
-        if streaming_callback and streaming_callback.accumulated_content and not self._model_output_rewritten:
+        if streaming_callback and streaming_callback.accumulated_content and not _model_output_rewritten.get():
             llm_generated_output = streaming_callback.accumulated_content
         else:
             llm_generated_output = llm_result.output.get("content", "")

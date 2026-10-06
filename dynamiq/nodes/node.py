@@ -114,6 +114,9 @@ def is_retryable_error(exc: BaseException) -> bool:
     Only certainly-permanent failures are non-retryable; anything unrecognised is retried
     as before. Every node type runs through this loop, not only LLMs.
     """
+    # An exception can declare itself permanent (hook stops do).
+    if getattr(exc, "retryable", True) is False:
+        return False
     try:
         from litellm.exceptions import (
             AuthenticationError,

@@ -38,38 +38,40 @@ class ToolExecutionException(RecoverableAgentException):
     pass
 
 
-class HookStopException(Exception):
-    """
-    Raised by a hook to end the agent run.
+class HookBlockedException(Exception):
+    """A hook ended the agent run. Not recoverable: the ReAct loop never turns it into an observation."""
 
-    Deliberately not a RecoverableAgentException: the agent must not turn it into an observation and continue.
-    """
+    outcome: str
 
-    pass
-
-
-class ToolHookStopException(HookStopException):
-    """Raised by a tool hook configured with ``stop_agent=True`` (or ``on_error="stop"``) to end the agent run."""
-
-    pass
-
-
-class ModelHookStopException(HookStopException):
-    """Raised by a model hook that blocks the model call with ``on_block="fail"`` (or ``on_error="stop"``)."""
-
-    pass
-
-
-class ModelCallBlockedException(Exception):
-    """
-    Raised by a model hook with ``on_block="answer"``: the run ends successfully with ``message`` as the answer.
-
-    Caught once, in ``Agent.execute``. Not a RecoverableAgentException, so the ReAct loop never swallows it.
-    """
-
-    def __init__(self, message: str):
+    def __init__(self, message: str = "", hook: str | None = None, point: str | None = None):
         super().__init__(message)
         self.message = message
+        self.hook = hook
+        self.point = point
+
+
+class HookStopException(HookBlockedException):
+    """A hook ended the run with a failure. Never retried (``retryable = False``)."""
+
+    retryable = False
+    outcome = "fail"
+
+
+class HookAnswerException(HookBlockedException):
+    """A hook ended the run successfully with ``message`` as the answer. Caught once, in ``Agent.execute``."""
+
+    outcome = "answer"
+
+
+class ToolBlockedException(ToolExecutionException):
+    """A hook blocked a tool call: ``str(exc)`` goes back to the model as the observation."""
+
+    outcome = "observation"
+
+    def __init__(self, message: str, hook: str | None = None, point: str | None = None):
+        super().__init__(message)
+        self.hook = hook
+        self.point = point
 
 
 class InvalidActionException(RecoverableAgentException):
