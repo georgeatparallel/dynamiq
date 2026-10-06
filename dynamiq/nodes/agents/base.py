@@ -956,6 +956,8 @@ class Agent(AgentIterativeCheckpointMixin, Node):
             kwargs.pop("run_depends", None)
 
             hook_blocked: HookAnswerException | None = None
+            # Set by `_run_agent`: a run that ends before it (an input hook) must not save the previous run's message.
+            self._pinned_input = None
             try:
                 try:
                     input_message = self._apply_input_hooks(input_message, config, **kwargs)
@@ -1775,7 +1777,12 @@ class Agent(AgentIterativeCheckpointMixin, Node):
             hooks=[*inherited, *self._own_hook_pairs()],
         )
         if inherited:
-            ctx.state, ctx.lock = parent.state, parent.lock
+            # Only the inherited hooks' slices are shared with the parent run; the sub-agent's own hooks keep a
+            # state of their own, so their per-run semantics do not depend on the parent's config.
+            ctx.lock = parent.lock
+            with parent.lock:
+                parent_slices = parent.state.setdefault("hooks", {})
+                ctx.state["hooks"] = {key: parent_slices.setdefault(key, {}) for key, _ in inherited}
         if parent is not None:
             ctx.approval_lock = parent.approval_lock  # sub-agents of one run ask one question at a time too
         self._restored_hook_state = None  # never carry a previous run's checkpoint into this one

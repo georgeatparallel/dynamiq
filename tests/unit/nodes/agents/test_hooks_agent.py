@@ -1224,3 +1224,40 @@ def test_a_vetoed_delegated_answer_is_not_in_the_tool_event():
             parent.run(input_data={"input": "hi"})
     assert "SECRET" not in json.dumps(streamed, default=str)
     assert ("answer", "Withheld.") in streamed
+
+
+# --- review of e7d8d3a ---------------------------------------------------------------------------------------------
+
+
+def test_an_input_hook_that_fails_the_run_does_not_save_the_previous_runs_message():
+    from dynamiq.memory import Memory
+    from dynamiq.memory.backends import InMemory
+
+    memory = Memory(backend=InMemory())
+    guard = RegexHook(patterns=[r"forbidden"], on=["input"], on_violation=BlockAs.FAIL, message="stop")
+    agent = build_agent([guard], memory=memory)
+    run_scripted(
+        agent, InferenceMode.STRUCTURED_OUTPUT, [final_step("ok")], question="first user message",
+        input_extra={"user_id": "alice", "session_id": "s1"},
+    )
+    before = len(memory.get_all())
+    with scripted(agent, InferenceMode.STRUCTURED_OUTPUT, [final_step("ok")]):
+        result = agent.run(input_data={"input": "forbidden", "user_id": "bob", "session_id": "s2"})
+    assert result.status == RunnableStatus.FAILURE
+    assert len(memory.get_all()) == before  # nothing new, in particular not "first user message" again
+
+
+def test_a_sub_agents_own_hooks_keep_a_fresh_state_per_run_even_with_an_inherited_hook_in_the_parent():
+    child = build_agent(
+        [CallLimitHook(tools=["search"], max_per_run=1)], tools=[SearchTool()], name="Researcher", id="child"
+    )
+    parent = build_agent(
+        [PIIHook(inherit=True)],
+        tools=[SubAgentTool(agent=child, name="Researcher", description="researches")],
+        delegation_allowed=True,
+    )
+    steps = [tool_step("Researcher", input="a"), tool_step("Researcher", input="b"), final_step("ok")]
+    child_steps = [tool_step("search", query="q"), final_step("done")] * 2  # one search per delegation
+    with scripted(child, InferenceMode.STRUCTURED_OUTPUT, child_steps):
+        run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, steps)
+    assert len(tool_inputs("search")) == 2  # one per delegation: the budget is per sub-agent run
