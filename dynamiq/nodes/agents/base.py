@@ -5,6 +5,7 @@ import json
 import mimetypes
 import re
 import threading
+from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from enum import Enum
@@ -118,8 +119,6 @@ from dynamiq.utils.utils import TRACING_REDACTED_KEYS, TRACING_REDACTED_PLACEHOL
 # A ContextVar rather than an Agent attribute: parallel runs of one agent instance must not share it.
 _model_output_rewritten: ContextVar[bool] = ContextVar("dynamiq_agent_model_output_rewritten", default=False)
 
-# One approval request at a time: parallel tool calls must not interleave prompts or take each other's answer.
-_approval_lock = threading.Lock()
 
 # Per-call tool overlay (e.g. LTM tools bound to a request's user_id); isolated
 # per thread / per asyncio task via ContextVar.
@@ -1777,6 +1776,8 @@ class Agent(AgentIterativeCheckpointMixin, Node):
         )
         if inherited:
             ctx.state, ctx.lock = parent.state, parent.lock
+        if parent is not None:
+            ctx.approval_lock = parent.approval_lock  # sub-agents of one run ask one question at a time too
         self._restored_hook_state = None  # never carry a previous run's checkpoint into this one
         return ctx
 
@@ -1877,12 +1878,26 @@ class Agent(AgentIterativeCheckpointMixin, Node):
             **kwargs,
         )
 
+    @contextmanager
+    def _one_approval_at_a_time(self, config: RunnableConfig | None):
+        """Serialize the approval requests of this run (parallel tool calls must not interleave prompts or take each
+        other's answer). The lock belongs to the run, so another run's pending human never blocks this one, and a
+        waiting call still notices cancellation."""
+        ctx = current_hook_ctx.get()
+        lock = ctx.approval_lock if ctx is not None else threading.Lock()
+        while not lock.acquire(timeout=0.5):
+            check_cancellation(config)
+        try:
+            yield
+        finally:
+            lock.release()
+
     def _request_tool_approval(
         self, tool_name: str, tool_input: dict, ask: Ask, hook: Hook, config: RunnableConfig | None, **kwargs
     ) -> dict:
         """Ask a human to approve a tool call (``Ask`` from a hook). Returns the input to run the tool with.
 
-        Uses the agent's own approval transport (console, or the agent's input stream). Requests are asked one at a
+        Uses the agent's own approval transport (console, or the agent's input stream). Requests of a run are asked one at a
         time (the stream protocol has no per-call id), and nothing is stored between calls, so parallel calls never
         share an answer; after a resume the call is asked again.
         Raises ``ToolBlockedException`` if the human declines or no answer can be obtained (fail closed).
@@ -1897,12 +1912,12 @@ class Agent(AgentIterativeCheckpointMixin, Node):
                     enabled=True, feedback_method=FeedbackMethod.STREAM, mutable_data_params=list(ask.editable_params)
                 )
                 # No per-call id in stream requests: one is open at a time, so no call takes another's answer.
-                with _approval_lock:
+                with self._one_approval_at_a_time(config):
                     answer = self.send_streaming_approval_message(prompt, tool_input, approval_config, config, **kwargs)
             else:
                 arguments = json.dumps(tool_input, indent=2, ensure_ascii=False, default=str)
                 text = f"{prompt}\n{arguments}\nPress Enter to approve, or type your feedback to decline: "
-                with _approval_lock:
+                with self._one_approval_at_a_time(config):
                     answer = self.send_console_approval_message(text, config=config)
         except (EOFError, ValueError) as e:
             logger.warning(f"Agent {self.name} - {self.id}: no approval for '{tool_name}' ({type(e).__name__}): {e}")

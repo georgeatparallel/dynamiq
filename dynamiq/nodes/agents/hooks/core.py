@@ -178,6 +178,7 @@ class HookContext:
     config: RunnableConfig | None = None
     hooks: list[tuple[str, "Hook"]] = field(default_factory=list)
     memory_answer: list = field(default_factory=list)
+    approval_lock: Any = field(default_factory=threading.Lock)
 
     def for_call(self, **changes) -> "HookContext":
         """A view for one call that shares ``state`` and ``lock`` with the run context."""

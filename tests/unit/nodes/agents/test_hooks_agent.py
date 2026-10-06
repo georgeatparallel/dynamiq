@@ -1140,3 +1140,87 @@ def test_the_live_filter_keeps_the_text_after_a_match_longer_than_the_lookback()
     streamed = "".join(live.feed(text[i : i + 3]) for i in range(0, len(text), 3)) + live.finish()
     assert streamed.endswith(" thanks a lot for that.")
     assert streamed.startswith("Contact: ")
+
+
+# --- review of 091fdcc ---------------------------------------------------------------------------------------------
+
+
+def test_a_pending_approval_in_one_run_does_not_block_another_run(monkeypatch):
+    from dynamiq.nodes.agents import Agent
+    from dynamiq.types.feedback import ApprovalInputData, FeedbackMethod
+    from dynamiq.types.streaming import StreamingConfig, StreamingMode
+
+    first_waiting, release_first, second_asked = threading.Event(), threading.Event(), threading.Event()
+
+    def ask(agent, template, input_data, approval_config, config=None, **kwargs):
+        if agent.name == "slow":
+            first_waiting.set()
+            release_first.wait(5)  # a human who never answers (until the test ends)
+        else:
+            second_asked.set()
+        return ApprovalInputData(is_approved=True, feedback="")
+
+    monkeypatch.setattr(Agent, "send_streaming_approval_message", ask)
+
+    def agent_named(name):
+        return build_agent(
+            [ToolPolicyHook(tools=["search"], approval=True, feedback_method=FeedbackMethod.STREAM)],
+            tools=[SearchTool()],
+            streaming=StreamingConfig(enabled=True, mode=StreamingMode.FINAL),
+            name=name,
+        )
+
+    slow, other = agent_named("slow"), agent_named("other")
+    steps = [tool_step("search", query="q"), final_step("ok")]
+    runner = threading.Thread(
+        target=lambda: run_scripted(slow, InferenceMode.STRUCTURED_OUTPUT, steps), daemon=True
+    )
+    runner.start()
+    assert first_waiting.wait(5)
+    try:
+        with scripted_streaming(other, InferenceMode.STRUCTURED_OUTPUT, steps):
+            other_thread = threading.Thread(target=lambda: other.run(input_data={"input": "go"}), daemon=True)
+            other_thread.start()
+            assert second_asked.wait(3), "the second run's approval was blocked by the first run's pending human"
+            other_thread.join(5)
+    finally:
+        release_first.set()
+        runner.join(5)
+
+
+@modes
+def test_a_delegated_final_answer_is_not_in_the_raw_tool_event(mode):
+    from dynamiq.types.streaming import StreamingConfig, StreamingMode
+
+    child = child_agent("x")
+    parent = build_agent(
+        [RegexHook(patterns=[r"SECRET\d+"], action="mask", on=["output"])],
+        tools=[SubAgentTool(agent=child, name="Researcher", description="researches")],
+        delegation_allowed=True,
+        streaming=StreamingConfig(enabled=True, mode=StreamingMode.ALL),
+    )
+    steps = [tool_step("Researcher", input="q", delegate_final=True), final_step("unused")]
+    with scripted(child, mode, [final_step("the code is SECRET999")]):
+        with scripted_streaming(parent, mode, steps) as (_, streamed):
+            result = parent.run(input_data={"input": "hi"})
+    assert result.output["content"] == "the code is [REDACTED]"
+    assert "SECRET" not in json.dumps(streamed, default=str)
+
+
+def test_a_vetoed_delegated_answer_is_not_in_the_tool_event():
+    from dynamiq.types.streaming import StreamingConfig, StreamingMode
+
+    child = child_agent("x")
+    guard = RegexHook(patterns=[r"SECRET\d+"], on=["output"], on_violation=BlockAs.ANSWER, message="Withheld.")
+    parent = build_agent(
+        [guard],
+        tools=[SubAgentTool(agent=child, name="Researcher", description="researches")],
+        delegation_allowed=True,
+        streaming=StreamingConfig(enabled=True, mode=StreamingMode.ALL),
+    )
+    steps = [tool_step("Researcher", input="q", delegate_final=True), final_step("unused")]
+    with scripted(child, InferenceMode.STRUCTURED_OUTPUT, [final_step("the code is SECRET999")]):
+        with scripted_streaming(parent, InferenceMode.STRUCTURED_OUTPUT, steps) as (_, streamed):
+            parent.run(input_data={"input": "hi"})
+    assert "SECRET" not in json.dumps(streamed, default=str)
+    assert ("answer", "Withheld.") in streamed

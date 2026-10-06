@@ -1408,6 +1408,15 @@ class Agent(HistoryManagerMixin, BaseAgent):
 
             if delegate_final:
                 self.log_final_output(thought, tool_result, loop_num)
+                # The delegated answer is the final answer: the tool event gets it under the same rules as the answer
+                # stream (masked live, or held back for the one streamed after the on_output hooks).
+                shown_result = tool_result
+                if self.streaming.enabled:
+                    live_filter = self._live_answer_filter()
+                    if self._buffers_final_answer():
+                        shown_result = ""
+                    elif live_filter and isinstance(tool_result, str):
+                        shown_result = live_filter.mask_all(tool_result)
                 # Stream tool result (with files) before streaming final answer
                 self._stream_agent_event(
                     AgentToolResultEventMessageData(
@@ -1415,7 +1424,7 @@ class Agent(HistoryManagerMixin, BaseAgent):
                         name=tool.name,
                         tool=tool_data,
                         input=action_input,
-                        result=tool_result,
+                        result=shown_result,
                         files=tool_files,
                         loop_num=loop_num,
                         output=tool_output_meta,
