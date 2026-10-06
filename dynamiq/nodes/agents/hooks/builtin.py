@@ -36,6 +36,7 @@ from dynamiq.nodes.agents.hooks.core import (
     register_hook,
     sanitize_tool_name,
 )
+from dynamiq.nodes.agents.utils import decode_text_payload
 from dynamiq.nodes.detectors import LlamaGuardDetector, PromptInjectionDetector
 from dynamiq.nodes.node import InputTransformer, Node, OutputTransformer
 from dynamiq.prompts import Message, MessageRole, VisionMessage, VisionMessageTextContent
@@ -52,9 +53,15 @@ _RUN_POINTS = {"input": HookPoint.ON_INPUT, "tool_result": HookPoint.AFTER_TOOL,
 
 
 def iter_strings(value: Any) -> Iterator[str]:
-    """Every string leaf of a payload: dicts, lists and tuples are walked, and so is a ``ToolResult``."""
+    """Every string leaf of a payload: dicts, lists and tuples are walked, and so is a ``ToolResult``.
+
+    Bytes that hold text (an HTTP tool returns most JSON, HTML and XML bodies this way) count as a string.
+    """
     if isinstance(value, str):
         yield value
+    elif isinstance(value, (bytes, bytearray)):
+        if (text := decode_text_payload(value)) is not None:
+            yield text
     elif isinstance(value, ToolResult):
         yield from iter_strings([value.content, value.output, value.error])
     elif isinstance(value, dict):
@@ -65,9 +72,15 @@ def iter_strings(value: Any) -> Iterator[str]:
 
 
 def map_strings(value: Any, fn) -> Any:
-    """Copy of a payload with ``fn`` applied to every string leaf."""
+    """Copy of a payload with ``fn`` applied to every string leaf (text bytes too: changed ones become ``str``)."""
     if isinstance(value, str):
         return fn(value)
+    if isinstance(value, (bytes, bytearray)):
+        text = decode_text_payload(value)
+        if text is None:
+            return value
+        mapped = fn(text)
+        return value if mapped == text else mapped
     if isinstance(value, ToolResult):
         return ToolResult(map_strings(value.content, fn), map_strings(value.output, fn), map_strings(value.error, fn))
     if isinstance(value, dict):

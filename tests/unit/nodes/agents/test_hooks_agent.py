@@ -538,7 +538,7 @@ def test_the_hook_state_survives_a_checkpoint_and_a_resume():
     }
 
     resumed = build_agent([PIIHook(restore_in_output=True)])
-    resumed.restore_iteration_state(captured["state"])
+    resumed._iteration_state, resumed._has_restored_iteration = captured["state"], True  # read inside the run
     result, _ = run_scripted(
         resumed, InferenceMode.STRUCTURED_OUTPUT, [final_step("Done for <EMAIL_1>")], question="carry on"
     )
@@ -944,3 +944,126 @@ def test_from_context_sets_what_the_model_must_not_choose_even_against_tool_para
         input_extra={"metadata": {"tenant": "acme"}, "tool_params": {"by_name": {"search": {"mode": "from-params"}}}},
     )
     assert tool_inputs("search") == [{"query": "x", "mode": "acme"}]
+
+
+# --- review round 2 ---------------------------------------------------------------------------------------------
+
+
+def test_a_stale_checkpoint_state_never_leaks_into_a_fresh_run():
+    seen = []
+
+    class StateProbe(Hook):
+        def on_input(self, ctx, text):
+            seen.append(dict(ctx.state))
+            return ALLOW
+
+    agent = build_agent([StateProbe()])
+    agent._restored_hook_state = {"hooks": {"agent:0:pii": {"placeholder_to_value": {"<EMAIL_1>": "old@x.com"}}}}
+    run_scripted(agent, InferenceMode.STRUCTURED_OUTPUT, [final_step("ok")])
+    assert seen == [{}] and agent._restored_hook_state is None
+
+
+def test_console_approval_without_stdin_fails_closed(monkeypatch):
+    def no_stdin(prompt=""):
+        raise EOFError("EOF when reading a line")
+
+    monkeypatch.setattr("builtins.input", no_stdin)
+    _, recorder = run_scripted(
+        approval_agent(), InferenceMode.STRUCTURED_OUTPUT, [tool_step("search", query="a"), final_step("ok")]
+    )
+    assert TOOL_CALLS == [] and "could not be obtained" in recorder.sent_text(1)
+
+
+def test_stream_approvals_of_parallel_calls_are_asked_one_at_a_time(monkeypatch):
+    from dynamiq.nodes.agents import Agent
+    from dynamiq.types.feedback import ApprovalInputData, FeedbackMethod
+    from dynamiq.types.streaming import StreamingConfig, StreamingMode
+
+    open_requests, peak = [], []
+
+    def ask(agent, template, input_data, approval_config, config=None, **kwargs):
+        open_requests.append(1)
+        peak.append(len(open_requests))
+        threading.Event().wait(0.05)
+        open_requests.pop()
+        return ApprovalInputData(is_approved=True, feedback="")
+
+    monkeypatch.setattr(Agent, "send_streaming_approval_message", ask)
+    agent = build_agent(
+        [ToolPolicyHook(tools=["search"], approval=True, feedback_method=FeedbackMethod.STREAM)],
+        tools=[SearchTool(is_parallel_execution_allowed=True)],
+        streaming=StreamingConfig(enabled=True, mode=StreamingMode.FINAL),
+        parallel_tool_calls_enabled=True,
+    )
+    calls = [("search", {"query": "first"}), ("search", {"query": "second"})]
+    with scripted_streaming(agent, InferenceMode.FUNCTION_CALLING, [parallel_step(*calls), final_step("ok")]):
+        agent.run(input_data={"input": "go"})
+    assert len(tool_inputs("search")) == 2 and max(peak) == 1
+
+
+def test_detector_credentials_stay_out_of_the_traced_agent():
+    from dynamiq.connections import Lakera
+    from dynamiq.nodes.agents.hooks import PromptInjectionHook
+
+    agent = build_agent([PromptInjectionHook(detector={"connection": Lakera(api_key="sk-very-secret")})])
+    assert "sk-very-secret" not in json.dumps(agent.to_dict(for_tracing=True), default=str)
+    assert agent.to_dict(for_tracing=True)["hooks"][0]["detector"]["connection"]["type"].endswith("Lakera")
+    assert "sk-very-secret" in json.dumps(agent.model_dump(), default=str)  # the round trip keeps working
+
+
+class BytesTool(SearchTool):
+    """Returns its body as bytes, like an HTTP tool does for any content type that is not exactly JSON."""
+
+    name: str = "fetch"
+
+    def execute(self, input_data, config=None, **kwargs):
+        super().execute(input_data, config, **kwargs)
+        return {"content": b'{"contact": "ann@x.com", "note": "ok"}'}
+
+
+@modes
+def test_a_text_tool_result_returned_as_bytes_is_masked_like_a_string(mode):
+    agent = build_agent([PIIHook(on=["tool_result"])], tools=[BytesTool()])
+    _, recorder = run_scripted(agent, mode, [tool_step("fetch", query="x"), final_step("ok")])
+    assert "ann@x.com" not in recorder.sent_text(1) and "<EMAIL_1>" in recorder.sent_text(1)
+
+
+def test_binary_tool_results_are_left_alone():
+    from dynamiq.nodes.agents.hooks.builtin import iter_strings, map_strings
+
+    blob = b"\x00\x01 ann@x.com"
+    assert list(iter_strings({"a": blob})) == [] and map_strings(blob, str.upper) == blob
+    assert map_strings(b"plain", str.upper) == "PLAIN" and map_strings(b"same", lambda text: text) == b"same"
+
+
+@pytest.mark.parametrize("hooked", [True, False], ids=["output_hook", "no_hook"])
+def test_the_max_loops_fallback_answer_is_not_streamed_raw(hooked):
+    from dynamiq.nodes.agents.agent import Behavior
+    from dynamiq.types.streaming import StreamingConfig, StreamingMode
+
+    hooks = [RegexHook(patterns=[r"SECRET\d+"], action="mask", on=["output"])] if hooked else []
+    agent = build_agent(
+        hooks,
+        max_loops=2,
+        behaviour_on_max_loops=Behavior.RETURN,
+        streaming=StreamingConfig(enabled=True, mode=StreamingMode.FINAL),
+    )
+    steps = [tool_step("search", query="x"), tool_step("search", query="y"), final_step("the code is SECRET123")]
+    with scripted_streaming(agent, InferenceMode.STRUCTURED_OUTPUT, steps) as (_, streamed):
+        result = agent.run(input_data={"input": "hi"})
+    answers = "".join(content for step, content in streamed if step == "answer")
+    if hooked:
+        assert "SECRET" not in answers and "SECRET" not in result.output["content"]
+        assert answers.count("[REDACTED]") == 1  # once, after the hook
+    else:
+        assert "SECRET123" in answers
+
+
+def test_inherited_hooks_see_the_callers_user_id_inside_a_sub_agent():
+    policy = dict(tools=["search"], allow_if={"user_id": "alice"}, approval=False, inherit=True)
+    parent, child = parent_with_child([ToolPolicyHook(**policy)])
+    child.tools = [SearchTool()]
+    steps = [tool_step("Researcher", input="q"), final_step("ok")]
+    with scripted(child, InferenceMode.STRUCTURED_OUTPUT, [tool_step("search", query="c"), final_step("done")]):
+        run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, steps, input_extra={"user_id": "alice"})
+    assert [args["query"] for args in tool_inputs("search")] == ["c"]

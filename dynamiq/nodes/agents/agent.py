@@ -1906,6 +1906,7 @@ class Agent(HistoryManagerMixin, BaseAgent):
         self.state.max_loops = self.max_loops
 
         completed = self.get_start_iteration()
+        self._adopt_restored_hook_state()
         start_loop = completed + 1 if completed > 0 else 1
         self._requested_output_files = []
 
@@ -2053,9 +2054,14 @@ class Agent(HistoryManagerMixin, BaseAgent):
         else:
             max_loop_final_answer = self._handle_max_loops_exceeded(input_message, config, **kwargs)
             self._resolve_requested_output_files(strict=False)
-            if self.streaming.enabled:
+            if self.streaming.enabled and not self._buffers_final_answer():
+                live_filter = self._live_answer_filter()
                 self.stream_content(
-                    content=max_loop_final_answer,
+                    content=(
+                        live_filter.mask_all(max_loop_final_answer)
+                        if live_filter and isinstance(max_loop_final_answer, str)
+                        else max_loop_final_answer
+                    ),
                     source=self.name,
                     step="answer",
                     config=config,

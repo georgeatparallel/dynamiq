@@ -117,8 +117,8 @@ from dynamiq.utils.utils import TRACING_REDACTED_KEYS, TRACING_REDACTED_PLACEHOL
 # A ContextVar rather than an Agent attribute: parallel runs of one agent instance must not share it.
 _model_output_rewritten: ContextVar[bool] = ContextVar("dynamiq_agent_model_output_rewritten", default=False)
 
-# One console prompt at a time: parallel tool calls must not interleave their input() calls.
-_console_approval_lock = threading.Lock()
+# One approval request at a time: parallel tool calls must not interleave prompts or take each other's answer.
+_approval_lock = threading.Lock()
 
 # Per-call tool overlay (e.g. LTM tools bound to a request's user_id); isolated
 # per thread / per asyncio task via ContextVar.
@@ -572,6 +572,9 @@ class Agent(AgentIterativeCheckpointMixin, Node):
         tools_to_serialize = [t for t in self.tools if t.id not in self._excluded_tool_ids]
         data["tools"] = [tool.to_dict(**kwargs) for tool in tools_to_serialize]
         data["tools"] = data["tools"] + [mcp_server.to_dict(**kwargs) for mcp_server in self._mcp_servers]
+
+        # Like a node's own connection, a hook's detector connection is reduced to {id, type} in traces.
+        data["hooks"] = [self._hook_to_dict(hook, dumped, **kwargs) for hook, dumped in zip(self.hooks, data["hooks"])]
 
         data["memory"] = self.memory.to_dict(**kwargs) if self.memory else None
         data["long_term_memory"] = self.long_term_memory.to_dict(**kwargs) if self.long_term_memory else None
@@ -1760,18 +1763,36 @@ class Agent(AgentIterativeCheckpointMixin, Node):
         ctx = HookContext(
             agent_name=self.name,
             agent_id=self.id,
-            user_id=input_data.user_id,
-            session_id=input_data.session_id,
+            # Inside a sub-agent the ids are rewritten per agent for memory isolation; hooks see the caller's.
+            user_id=parent.user_id if parent is not None else input_data.user_id,
+            session_id=parent.session_id if parent is not None else input_data.session_id,
             metadata=dict(metadata),
             config=config,
             hooks=[*inherited, *self._own_hook_pairs()],
         )
         if inherited:
             ctx.state, ctx.lock = parent.state, parent.lock
-        if self._restored_hook_state:
-            ctx.state.update(deepcopy(self._restored_hook_state))
-            self._restored_hook_state = None
+        self._restored_hook_state = None  # never carry a previous run's checkpoint into this one
         return ctx
+
+    def _adopt_restored_hook_state(self) -> None:
+        """Load the checkpointed hook state into the running context.
+
+        The checkpoint is read inside ``_run_agent`` (``get_start_iteration``), after ``execute`` built the context,
+        so this runs right after it.
+        """
+        ctx = current_hook_ctx.get()
+        if ctx is not None and self._restored_hook_state:
+            with ctx.lock:
+                ctx.state.update(deepcopy(self._restored_hook_state))
+        self._restored_hook_state = None
+
+    @staticmethod
+    def _hook_to_dict(hook: Hook, dumped: dict, include_secure_params: bool = False, **kwargs) -> dict:
+        detector = getattr(hook, "detector", None)
+        if detector is None or include_secure_params:
+            return dumped
+        return {**dumped, "detector": {**dumped["detector"], "connection": detector.connection.to_dict(**kwargs)}}
 
     def _snapshot_hook_state(self) -> dict | None:
         """JSON-safe copy of the run's hook state for checkpoints."""
@@ -1856,8 +1877,9 @@ class Agent(AgentIterativeCheckpointMixin, Node):
     ) -> dict:
         """Ask a human to approve a tool call (``Ask`` from a hook). Returns the input to run the tool with.
 
-        Uses the agent's own approval transport (console, or the agent's input stream). Nothing is stored between
-        calls, so parallel calls of the same tool never share an answer; after a resume the call is asked again.
+        Uses the agent's own approval transport (console, or the agent's input stream). Requests are asked one at a
+        time (the stream protocol has no per-call id), and nothing is stored between calls, so parallel calls never
+        share an answer; after a resume the call is asked again.
         Raises ``ToolBlockedException`` if the human declines or no answer can be obtained (fail closed).
         """
         config = ensure_config(config)
@@ -1869,11 +1891,13 @@ class Agent(AgentIterativeCheckpointMixin, Node):
                 approval_config = ApprovalConfig(
                     enabled=True, feedback_method=FeedbackMethod.STREAM, mutable_data_params=list(ask.editable_params)
                 )
-                answer = self.send_streaming_approval_message(prompt, tool_input, approval_config, config, **kwargs)
+                # No per-call id in stream requests: one is open at a time, so no call takes another's answer.
+                with _approval_lock:
+                    answer = self.send_streaming_approval_message(prompt, tool_input, approval_config, config, **kwargs)
             else:
                 arguments = json.dumps(tool_input, indent=2, ensure_ascii=False, default=str)
                 text = f"{prompt}\n{arguments}\nPress Enter to approve, or type your feedback to decline: "
-                with _console_approval_lock:
+                with _approval_lock:
                     answer = self.send_console_approval_message(text, config=config)
         except (EOFError, ValueError) as e:
             logger.warning(f"Agent {self.name} - {self.id}: no approval for '{tool_name}' ({type(e).__name__}): {e}")

@@ -10,7 +10,7 @@ Run from this directory, or directly: `python main.py` puts this directory on sy
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from _common import (  # noqa: E402

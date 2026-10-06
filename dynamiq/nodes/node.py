@@ -963,7 +963,10 @@ class Node(BaseModel, Runnable, DryRunMixin, CheckpointNodeMixin, ABC):
         result = {}
 
         def _read_input():
-            result["feedback"] = input(template)
+            try:
+                result["feedback"] = input(template)
+            except BaseException as e:  # noqa: BLE001 - re-raised in the caller; a thread would swallow it
+                result["error"] = e
 
         input_thread = _threading.Thread(target=_read_input, daemon=True)
         input_thread.start()
@@ -972,6 +975,8 @@ class Node(BaseModel, Runnable, DryRunMixin, CheckpointNodeMixin, ABC):
             check_cancellation(config)
             input_thread.join(timeout=0.5)
 
+        if "error" in result:
+            raise result["error"]
         return ApprovalInputData(feedback=result.get("feedback", ""))
 
     def send_approval_message(
