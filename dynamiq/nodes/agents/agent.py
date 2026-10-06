@@ -1263,6 +1263,7 @@ class Agent(HistoryManagerMixin, BaseAgent):
                 config=config,
                 loop_num=loop_num,
                 suppress_answer=self._buffers_final_answer(),
+                answer_filter=self._live_answer_filter(),
                 **kwargs,
             )
 
@@ -1424,8 +1425,9 @@ class Agent(HistoryManagerMixin, BaseAgent):
                     **kwargs,
                 )
                 if self.streaming.enabled and not self._buffers_final_answer():
+                    live_filter = self._live_answer_filter()
                     self.stream_content(
-                        content=tool_result,
+                        content=live_filter.mask_all(tool_result) if live_filter else tool_result,
                         source=tool.name,
                         step="answer",
                         config=config,

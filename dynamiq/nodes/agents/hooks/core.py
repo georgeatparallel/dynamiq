@@ -2,7 +2,7 @@
 
 A hook implements the points it needs; every other point allows. Hooks are evaluated one by one: ``before_*`` and
 ``on_input`` in list order, ``after_*`` and ``on_output`` in reverse order. ``Modify`` feeds the next hook, ``Block``
-and ``Skip`` end the evaluation.
+and ``Skip`` end the evaluation, and an ``Ask`` (``before_tool``) is answered once every hook has run.
 
 ==============  ==========================================  ===============================================
 Point           When                                        Value (what ``Modify`` replaces)
@@ -27,6 +27,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from enum import Enum
 from typing import Any, ClassVar
 
@@ -40,6 +41,7 @@ from dynamiq.nodes.agents.exceptions import (
     ToolBlockedException,
 )
 from dynamiq.runnables import RunnableConfig
+from dynamiq.types.feedback import FeedbackMethod
 from dynamiq.utils.logger import logger
 
 
@@ -119,7 +121,21 @@ class Skip:
     result: Any
 
 
-Decision = Allow | Modify | Block | Skip
+@dataclass(frozen=True)
+class Ask:
+    """``before_tool`` only: ask a human to approve the call before it runs (through the agent's approval flow).
+
+    The human sees the input as it is when every hook has run, so a hook listed earlier that restores real values
+    (``pii`` with ``restore_in_tools``) makes the approval show them. ``editable_params`` are the arguments the human
+    may change. A refusal reaches the model as an observation. If several hooks ask, the first one is used.
+    """
+
+    prompt: str | None = None
+    feedback_method: FeedbackMethod = FeedbackMethod.CONSOLE
+    editable_params: tuple[str, ...] = ()
+
+
+Decision = Allow | Modify | Block | Skip | Ask
 ALLOW = Allow()
 
 
@@ -145,7 +161,8 @@ class HookContext:
     """Per-run context of the hooks: one per ``Agent.execute`` (so one per Map item and per sub-agent run).
 
     ``state`` is shared by all hooks and all parallel tool calls: JSON-serializable values only (it is checkpointed),
-    mutated under ``lock``. ``hook_state`` is the slice of the running hook.
+    mutated under ``lock``. ``hook_state`` is the slice of the running hook. ``hooks`` are the ``(state key, hook)``
+    pairs in effect for the run: those inherited from the parent agent, then the agent's own.
     """
 
     agent_name: str = ""
@@ -159,6 +176,7 @@ class HookContext:
     tool_call_id: str | None = None
     hook_key: str = ""
     config: RunnableConfig | None = None
+    hooks: list[tuple[str, "Hook"]] = field(default_factory=list)
 
     def for_call(self, **changes) -> "HookContext":
         """A view for one call that shares ``state`` and ``lock`` with the run context."""
@@ -211,6 +229,8 @@ class Hook(BaseModel):
     Attributes:
         name: Shown in traces, stream events and block outcomes. Defaults to the hook type.
         tools: Tool points only: the tools the hook applies to (``*`` or empty = all).
+        inherit: Also apply in the sub-agents this agent calls (and theirs), sharing the run state, so that for
+            example a PII mapping stays consistent across agents.
         on_error: What to do if the hook itself raises or times out.
         timeout_seconds: Per-call budget; a hook that overruns counts as failed. The worker thread cannot be killed.
     """
@@ -219,6 +239,7 @@ class Hook(BaseModel):
 
     name: str | None = None
     tools: list[str] = Field(default_factory=list)
+    inherit: bool = False
     on_error: HookErrorPolicy = HookErrorPolicy.BLOCK
     timeout_seconds: float | None = Field(default=None, gt=0)
 
@@ -264,6 +285,15 @@ class Hook(BaseModel):
     @property
     def display_name(self) -> str:
         return self.name or self.type_name
+
+    def live_lookback(self) -> int | None:
+        """How many characters this hook holds back to mask the answer while it streams, or ``None`` if it cannot
+        (then the agent buffers the answer and streams it once, after the hooks)."""
+        return None
+
+    def live_text(self, ctx: HookContext, text: str) -> str:
+        """The answer text as it should be streamed so far; only called when ``live_lookback`` is not ``None``."""
+        raise NotImplementedError
 
     def matches_tool(self, tool_name: str) -> bool:
         if not self.tools or "*" in self.tools:
@@ -317,20 +347,77 @@ def size_of(value: Any) -> int:
     return 0 if value is None else len(repr(value))
 
 
+class LiveAnswerFilter:
+    """Masks the answer while it streams. Chunks are held back by ``lookback`` characters, so a match that is still
+    incomplete (``ann@x.c``) is not sent in the clear; ``finish`` sends the rest. A match longer than the lookback
+    can still leak."""
+
+    def __init__(self, steps: list[Callable[[str], str]], lookback: int):
+        self.steps = steps
+        self.lookback = lookback
+        self.raw = ""
+        self.sent = ""
+
+    def _masked(self) -> str:
+        text = self.raw
+        for step in self.steps:
+            text = step(text)
+        return text
+
+    def feed(self, chunk: str) -> str:
+        self.raw += chunk
+        masked = self._masked()
+        safe = masked[: max(len(masked) - self.lookback, 0)]
+        if not safe.startswith(self.sent):
+            return ""
+        out, self.sent = safe[len(self.sent) :], safe
+        return out
+
+    def finish(self) -> str:
+        out = self._masked()[len(self.sent) :]
+        self.raw = self.sent = ""
+        return out
+
+    def mask_all(self, text: str) -> str:
+        """The whole text masked at once (for an answer that is not streamed in chunks)."""
+        self.raw = text
+        masked = self._masked()
+        self.raw = self.sent = ""
+        return masked
+
+
 @dataclass
 class HookRun:
-    """Outcome of one point: the (possibly modified) value, or the ``Skip`` a ``before_tool`` hook returned."""
+    """Outcome of one point: the (possibly modified) value, a ``Skip``, or an ``Ask`` (with the hook that asked)."""
 
     value: Any
     skip: Skip | None = None
+    ask: Ask | None = None
+    asked_by: Hook | None = None
 
 
 class HookRunner:
-    def __init__(self, hooks: list[Hook]):
+    def __init__(self, hooks: list[Hook], keys: list[str] | None = None):
+        """``keys`` name each hook's slice of the run state (default: its position and name)."""
         self.hooks = list(hooks)
+        self.keys = keys or [f"{index}:{hook.display_name}" for index, hook in enumerate(self.hooks)]
 
     def has(self, *points: HookPoint) -> bool:
         return any(hook.points() & set(points) for hook in self.hooks)
+
+    def live_answer_filter(self, ctx: HookContext) -> LiveAnswerFilter | None:
+        """A filter that masks the answer while it streams, if every hook that touches the answer can do that."""
+        if self.has(HookPoint.AFTER_MODEL):
+            return None
+        answer_hooks = [(key, hook) for key, hook in zip(self.keys, self.hooks) if HookPoint.ON_OUTPUT in hook.points()]
+        lookbacks = [hook.live_lookback() for _, hook in answer_hooks]
+        if not answer_hooks or None in lookbacks:
+            return None
+        steps = [
+            (lambda text, hook=hook, hook_ctx=ctx.for_call(hook_key=key): hook.live_text(hook_ctx, text))
+            for key, hook in reversed(answer_hooks)
+        ]
+        return LiveAnswerFilter(steps, max(lookbacks))
 
     def run(
         self,
@@ -347,6 +434,7 @@ class HookRunner:
         At ``before_tool`` ``value`` is ``call.input``.
         """
         indexed = list(enumerate(self.hooks))
+        ask, asked_by = None, None
         if point in REVERSED_POINTS:
             indexed.reverse()
 
@@ -355,7 +443,7 @@ class HookRunner:
                 continue
             if point in TOOL_POINTS and call is not None and not hook.matches_tool(call.name):
                 continue
-            hook_ctx = ctx.for_call(hook_key=f"{index}:{hook.display_name}")
+            hook_ctx = ctx.for_call(hook_key=self.keys[index])
             try:
                 decision = self._invoke(hook, point, hook_ctx, value, call)
             except (HookBlockedException, RecoverableAgentException):
@@ -380,11 +468,16 @@ class HookRunner:
             elif isinstance(decision, Skip) and point == HookPoint.BEFORE_TOOL:
                 _record(events, hook, point, "skip", call)
                 return HookRun(value=value, skip=decision)
+            elif isinstance(decision, Ask) and point == HookPoint.BEFORE_TOOL:
+                ask, asked_by = ask or decision, asked_by or hook
             elif isinstance(decision, Block):
                 kind = self._effective_block_as(point, decision)
                 _record(events, hook, point, "block", call, outcome=kind.value)
-                raise _BLOCK_EXCEPTIONS[kind](decision.reason, hook=hook.display_name, point=point.value)
-        return HookRun(value=value)
+                reason = decision.reason
+                if kind == BlockAs.FAIL:
+                    reason = f"Hook '{hook.display_name}' stopped the run at {point.value}: {reason}"
+                raise _BLOCK_EXCEPTIONS[kind](reason, hook=hook.display_name, point=point.value)
+        return HookRun(value=value, ask=ask, asked_by=asked_by)
 
     @staticmethod
     def _effective_block_as(point: HookPoint, block: Block) -> BlockAs:

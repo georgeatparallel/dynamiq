@@ -1,16 +1,19 @@
 """Built-in hooks, registered under short names for YAML and UI use.
 
 transform         JSONPath rewrite of tool input (merged into the model's arguments) and of tool output.
-tool_policy       deny a tool, or allow it only for matching users.
+tool_policy       deny a tool, allow it only for matching users, or ask a human to approve each call.
 call_limit        at most N calls per run.
 regex             block or mask regex matches, with presets.
 pii               detect, mask and restore PII with numbered placeholders.
 prompt_injection  prompt-injection check of the user input and of tool results through a detector connection.
 """
 
+import copy
+import dataclasses
 import importlib
 import json
 import re
+import threading
 from collections.abc import Iterator
 from typing import Any, Literal
 
@@ -20,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 from dynamiq.connections import HuggingFace, Lakera, Replicate
 from dynamiq.nodes.agents.hooks.core import (
     ALLOW,
+    Ask,
     Block,
     BlockAs,
     Decision,
@@ -34,7 +38,9 @@ from dynamiq.nodes.agents.hooks.core import (
 )
 from dynamiq.nodes.detectors import LlamaGuardDetector, PromptInjectionDetector
 from dynamiq.nodes.node import InputTransformer, Node, OutputTransformer
+from dynamiq.prompts import Message, MessageRole, VisionMessage, VisionMessageTextContent
 from dynamiq.runnables import RunnableConfig, RunnableStatus
+from dynamiq.types.feedback import FeedbackMethod
 from dynamiq.utils.jsonpath import _is_rooted, is_jsonpath
 from dynamiq.utils.jsonpath import mapper as jsonpath_mapper
 from dynamiq.utils.logger import logger
@@ -71,6 +77,17 @@ def map_strings(value: Any, fn) -> Any:
     return value
 
 
+def map_message_text(message: Message | VisionMessage, fn) -> Message | VisionMessage:
+    """Copy of a message with ``fn`` applied to its text (images and files are untouched)."""
+    if isinstance(message, Message):
+        return message.model_copy(update={"content": fn(message.content or "")})
+    parts = [
+        part.model_copy(update={"text": fn(part.text)}) if isinstance(part, VisionMessageTextContent) else part
+        for part in message.content
+    ]
+    return message.model_copy(update={"content": parts})
+
+
 def compile_regex(pattern: str, label: str = "regex") -> "regex.Pattern":
     try:
         return regex.compile(pattern)
@@ -86,12 +103,17 @@ class TransformHook(Hook):
     ``input_transformer``: listed keys are set and every other argument is kept. A path that matches nothing is
     skipped with a warning, never written as ``None``. A selector value that is not a JSONPath is a constant.
 
+    ``from_context`` sets arguments from the run context (``{argument: user_id | session_id | metadata.<key>}``), so
+    that a value the model must not choose (a tenant, a user id) comes from the caller. It overrides what the model
+    sent; a missing context value skips the argument with a warning.
+
     ``output_transformer`` is applied to ``{"content": <result>}``; a JSON text result is parsed first so that paths
     can select from it.
     """
 
     input_transformer: InputTransformer = Field(default_factory=InputTransformer)
     output_transformer: OutputTransformer = Field(default_factory=OutputTransformer)
+    from_context: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate(self):
@@ -105,13 +127,18 @@ class TransformHook(Hook):
                     raise ValueError(
                         f"transform.{label}_transformer.selector[{key!r}] {expression!r} is not a valid JSONPath"
                     )
-        if not (self.input_transformer.selector or self.output_transformer.path or self.output_transformer.selector):
-            raise ValueError("transform needs an input_transformer.selector or an output_transformer")
+        if not (
+            self.input_transformer.selector
+            or self.from_context
+            or self.output_transformer.path
+            or self.output_transformer.selector
+        ):
+            raise ValueError("transform needs an input_transformer.selector, `from_context` or an output_transformer")
         return self
 
     def points(self) -> set[HookPoint]:
         points = set()
-        if self.input_transformer.selector:
+        if self.input_transformer.selector or self.from_context:
             points.add(HookPoint.BEFORE_TOOL)
         if self.output_transformer.path or self.output_transformer.selector:
             points.add(HookPoint.AFTER_TOOL)
@@ -121,13 +148,18 @@ class TransformHook(Hook):
         if not isinstance(call.input, dict):
             return ALLOW
         merged = dict(call.input)
-        for key, expression in self.input_transformer.selector.items():
+        for key, expression in (self.input_transformer.selector or {}).items():
             if not _is_rooted(expression):
                 merged[key] = expression
             elif (value := jsonpath_mapper(call.input, {key: expression}).get(key)) is not None:
                 merged[key] = value
             else:
                 logger.warning(f"transform hook for '{call.name}': {expression!r} matched nothing; {key!r} skipped")
+        for key, path in self.from_context.items():
+            if (value := ctx.lookup(path)) is not None:
+                merged[key] = value
+            else:
+                logger.warning(f"transform hook for '{call.name}': context {path!r} is not set; {key!r} skipped")
         return Modify(merged) if merged != call.input else ALLOW
 
     def after_tool(self, ctx: HookContext, call: ToolCall, result: ToolResult) -> Decision:
@@ -163,42 +195,54 @@ class GuardHook(Hook):
 
 @register_hook("tool_policy")
 class ToolPolicyHook(GuardHook):
-    """Deny a tool, or allow it only when the run context matches.
+    """Deny a tool, allow it only when the run context matches, and/or ask a human to approve each call.
 
     Attributes:
         deny: Always block the matching tools.
-        allow_if: ``{context path: expected value or list of values}``; every entry must match. Paths: ``user_id``,
-            ``session_id``, ``metadata.<key>``.
-
-    Human approval (``approval: true``) is not implemented yet.
+        allow_if: ``{context path: expected value or list of values}``; every entry must match, otherwise the call is
+            blocked. Paths: ``user_id``, ``session_id``, ``metadata.<key>``.
+        approval: Ask a human to approve each call before it runs, through the agent's approval flow. The human sees
+            the arguments as they are when all hooks ran (list a ``pii`` hook with ``restore_in_tools`` first and the
+            approval shows the real values). A refusal reaches the model as an observation.
+        approval_unless: Context rules (same shape as ``allow_if``) that skip the approval, e.g. for admins.
+        approval_message: What the human is asked. Defaults to a message naming the tool.
+        feedback_method: ``console`` or ``stream`` (the agent's input stream).
+        editable_params: Arguments the human may change when approving.
     """
 
     message: str = "This tool is not available."
     deny: bool = False
     allow_if: dict[str, Any] | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _approval_not_supported(cls, data):
-        if isinstance(data, dict) and "approval" in data:
-            raise ValueError("tool_policy `approval` is not supported yet; use `deny` or `allow_if`")
-        return data
+    approval: bool = False
+    approval_unless: dict[str, Any] | None = None
+    approval_message: str | None = None
+    feedback_method: FeedbackMethod = FeedbackMethod.CONSOLE
+    editable_params: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _needs_a_rule(self):
-        if not self.deny and not self.allow_if:
-            raise ValueError("tool_policy needs `deny: true` or `allow_if`; otherwise it would allow everything")
+        if not (self.deny or self.allow_if or self.approval):
+            raise ValueError("tool_policy needs `deny`, `allow_if` or `approval`; otherwise it would allow everything")
+        if self.approval_unless and not self.approval:
+            raise ValueError("tool_policy `approval_unless` only makes sense with `approval: true`")
         return self
 
     def points(self) -> set[HookPoint]:
         return {HookPoint.BEFORE_TOOL}
 
+    @staticmethod
+    def _matches(ctx: HookContext, rules: dict[str, Any]) -> bool:
+        return all(
+            ctx.lookup(path) in (expected if isinstance(expected, list) else [expected])
+            for path, expected in rules.items()
+        )
+
     def before_tool(self, ctx: HookContext, call: ToolCall) -> Decision:
-        if self.deny:
+        if self.deny or (self.allow_if and not self._matches(ctx, self.allow_if)):
             return self.violation()
-        for path, expected in (self.allow_if or {}).items():
-            if ctx.lookup(path) not in (expected if isinstance(expected, list) else [expected]):
-                return self.violation()
+        if self.approval and not (self.approval_unless and self._matches(ctx, self.approval_unless)):
+            prompt = self.approval_message or f"Approve calling '{call.name}' with these arguments?"
+            return Ask(prompt, self.feedback_method, tuple(self.editable_params))
         return ALLOW
 
 
@@ -236,9 +280,23 @@ class TextGuardHook(GuardHook):
 
     on: list[RunPoint] = Field(default_factory=lambda: ["input", "tool_result", "output"], min_length=1)
     action: Literal["block", "mask"] = "block"
+    live_stream: bool = Field(
+        default=False,
+        description=(
+            "With `action: mask`, stream the answer while it is generated instead of buffering it until the hooks "
+            "ran. The stream is held back by `stream_lookback` characters, so a match longer than that can leak."
+        ),
+    )
+    stream_lookback: int = Field(default=64, ge=8)
 
     def points(self) -> set[HookPoint]:
         return {_RUN_POINTS[name] for name in self.on}
+
+    def live_lookback(self) -> int | None:
+        return self.stream_lookback if self.live_stream and self.action == "mask" else None
+
+    def live_text(self, ctx: HookContext, text: str) -> str:
+        return self._mask(ctx, text, "output")
 
     def _violates(self, text: str) -> bool:
         raise NotImplementedError
@@ -348,11 +406,16 @@ def _is_valid_match(entity: str | None, text: str) -> bool:
 class PIIHook(TextGuardHook):
     """Detect PII and mask it with numbered placeholders (``<EMAIL_1>``) so that the agent keeps working.
 
-    Masking happens at the source: the user's message is masked once and each tool result is masked once, so the
-    conversation history, memory, checkpoints and the summarizer only ever hold placeholders and nothing is
-    re-scanned on later LLM calls. One mapping per run lives in the run context and is checkpointed with the agent.
+    One mapping per run lives in the run context and is checkpointed with the agent. ``scope`` decides what is masked:
+
+    * ``persisted`` (default): masking at the source. The user's message and each tool result are masked once, so the
+      conversation history, memory, checkpoints and the summarizer only ever hold placeholders, and nothing is
+      re-scanned on later LLM calls.
+    * ``request``: masking of this request only. History, memory and checkpoints keep the raw values, and every LLM
+      call is sent a masked copy of the history (so the whole history is scanned again on each call).
 
     Attributes:
+        scope: ``persisted`` or ``request`` (see above); ``request`` needs ``action: mask``.
         entities: What to detect. ``custom_patterns``: ``{NAME: regex}`` for more entity types.
         restore_in_tools: Tools that receive the real values: placeholders in their arguments are replaced right
             before the call. Other tools get placeholders. ``*`` means all tools.
@@ -366,6 +429,7 @@ class PIIHook(TextGuardHook):
 
     message: str = "The request contains personal data and was blocked."
     action: Literal["block", "mask"] = "mask"
+    scope: Literal["persisted", "request"] = "persisted"
     entities: list[PIIEntity] = Field(default_factory=lambda: list(_PII_PATTERNS))
     custom_patterns: dict[str, str] = Field(default_factory=dict)
     restore_in_tools: list[str] = Field(default_factory=list)
@@ -385,6 +449,8 @@ class PIIHook(TextGuardHook):
     def _compile(self):
         if not self.entities and not self.custom_patterns:
             raise ValueError("pii needs at least one entity or custom pattern")
+        if self.scope == "request" and self.action != "mask":
+            raise ValueError("pii `scope: request` only applies to `action: mask`")
         built_in = [(name.upper(), name, _PII_PATTERNS[name]) for name in _PII_PATTERNS if name in self.entities]
         custom = [(name, None, pattern) for name, pattern in self.custom_patterns.items()]
         self._detectors = [
@@ -395,6 +461,8 @@ class PIIHook(TextGuardHook):
 
     def points(self) -> set[HookPoint]:
         points = super().points()
+        if self.scope == "request":
+            points = (points - {HookPoint.ON_INPUT, HookPoint.AFTER_TOOL}) | {HookPoint.BEFORE_MODEL}
         if self.restore_in_tools:
             points.add(HookPoint.BEFORE_TOOL)
         if self.restore_in_output:
@@ -450,6 +518,42 @@ class PIIHook(TextGuardHook):
         return "*" in self.restore_in_tools or sanitize_tool_name(tool_name) in {
             sanitize_tool_name(name) for name in self.restore_in_tools
         }
+
+    def live_text(self, ctx: HookContext, text: str) -> str:
+        """The streamed answer is masked (and restored) on a copy of the run state, so that the partial texts of a
+        stream leave no placeholder behind in the real mapping."""
+        with ctx.lock:
+            preview = dataclasses.replace(ctx, state=copy.deepcopy(ctx.state), lock=threading.RLock())
+        if "output" in self.on:
+            text = self._mask(preview, text, "output")
+        if self.restore_in_output:
+            text = self._restore(preview, text, only_origin="input")
+        return text
+
+    def before_model(self, ctx: HookContext, messages: list) -> Decision:
+        """``scope: request``: send a masked copy of the history; the history itself is left alone."""
+        masked = []
+        for message in messages:
+            origin = self._origin_of(message)
+            masked.append(
+                map_message_text(message, lambda text, origin=origin: self._mask(ctx, text, origin))
+                if origin in self.on
+                else message
+            )
+        return Modify(masked) if masked != messages else ALLOW
+
+    @staticmethod
+    def _origin_of(message: Message | VisionMessage) -> str | None:
+        """Where a history message came from: the user, a tool result, or the model (``None`` for the system)."""
+        match message.role:
+            case MessageRole.SYSTEM:
+                return None
+            case MessageRole.TOOL:
+                return "tool_result"
+            case MessageRole.ASSISTANT:
+                return "output"
+        text = message.content if isinstance(message, Message) else ""
+        return "tool_result" if str(text).startswith("Observation") else "input"
 
     def before_tool(self, ctx: HookContext, call: ToolCall) -> Decision:
         if not self._restores_for(call.name):

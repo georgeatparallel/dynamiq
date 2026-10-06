@@ -11,8 +11,10 @@ from dynamiq import Workflow
 from dynamiq.callbacks import DynamiqTracingCallbackHandler, TracingCallbackHandler
 from dynamiq.connections.managers import get_connection_manager
 from dynamiq.nodes.agents import Agent
+from dynamiq.nodes import Node
 from dynamiq.nodes.llms import OpenAI
 from dynamiq.runnables import RunnableConfig, RunnableResult, RunnableStatus
+from dynamiq.types.feedback import ApprovalInputData
 
 # override=True: values from .env win over ones already exported in the shell (often stale).
 load_dotenv(find_dotenv(), override=True)
@@ -92,13 +94,28 @@ def offline_llm(scripts: dict[str, list[dict]]):
 
 
 @contextmanager
-def llm_session(offline: bool, scripts: dict[str, list[dict]]):
-    """The scripted LLM when offline (yielding the prompts it was sent), the real one otherwise (yielding ``[]``)."""
-    if offline:
-        with offline_llm(scripts) as seen:
-            yield seen
-    else:
+def scripted_human(answers: list[str]):
+    """Answer console approval questions from ``answers`` ("" approves, anything else declines with that feedback)."""
+    pending = list(answers)
+
+    def ask(self, template, config=None):
+        answer = pending.pop(0) if pending else ""
+        print(f"[approval asked] {template.strip()}\n[scripted human answers] {answer!r}")
+        return ApprovalInputData(feedback=answer)
+
+    with patch.object(Node, "send_console_approval_message", ask):
+        yield
+
+
+@contextmanager
+def llm_session(offline: bool, scripts: dict[str, list[dict]], approvals: list[str] | None = None):
+    """Offline: the scripted LLM (and a scripted human for approvals), yielding the prompts the LLM was sent.
+    Online: the real LLM and a real console prompt, yielding ``[]``."""
+    if not offline:
         yield []
+        return
+    with offline_llm(scripts) as seen, scripted_human(approvals or []):
+        yield seen
 
 
 def run_scenario(workflow: Workflow, agent: Agent, title: str, input_data: dict, ui: bool = False) -> RunnableResult:

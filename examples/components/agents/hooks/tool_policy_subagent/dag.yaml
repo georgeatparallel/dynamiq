@@ -4,6 +4,10 @@
 #                       (the run context carries user_id / session_id / metadata, so the rule is per user).
 #   researcher-access   a sub-agent call is an ordinary tool call for the parent's hooks: the same policy applies,
 #                       and a blocked delegation never starts the child.
+#   refund-approval     tool_policy with `approval: true`: a human approves each refund before it runs (the call is
+#                       paused on the agent's approval flow: console here, or `feedback_method: stream`), unless
+#                       the user is an admin. The human sees the real arguments; a refusal reaches the model as an
+#                       observation; `editable_params` would let the human change an argument.
 #   search-budget       call_limit: at most 2 web-search calls per RUN. The counter lives in the run context, so it
 #                       is exact with parallel tool calls and separate for every Map item / every run.
 #
@@ -22,6 +26,7 @@ nodes:
     name: Ops Agent
     role: |
       Operations assistant. Use web-search to look things up (be thrifty), delete-customer to delete a customer,
+      refund-customer to refund one,
       and the Researcher sub-agent for deeper research.
     inference_mode: STRUCTURED_OUTPUT
     llm:
@@ -38,6 +43,13 @@ nodes:
         code: |
           def run(input_data):
               return "results for %s" % input_data.get("query")
+      - id: refund-customer-tool
+        type: dynamiq.nodes.tools.python.Python
+        name: refund-customer
+        description: Refund a customer. Input fields - customer_id, amount.
+        code: |
+          def run(input_data):
+              return "refunded %s to customer %s" % (input_data.get("amount"), input_data.get("customer_id"))
       - id: delete-customer-tool
         type: dynamiq.nodes.tools.python.Python
         name: delete-customer
@@ -72,6 +84,13 @@ nodes:
         allow_if:
           metadata.role: [admin, analyst]
         message: "Your role may not use the Researcher. Answer from what you already know."
+      - type: tool_policy
+        name: refund-approval
+        tools: [refund-customer]
+        approval: true
+        approval_unless:
+          metadata.role: admin
+        approval_message: "Approve this refund?"
       - type: call_limit
         name: search-budget
         tools: [web-search]

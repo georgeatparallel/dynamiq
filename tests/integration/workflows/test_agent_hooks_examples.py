@@ -47,7 +47,10 @@ def test_tool_policy_example():
     assert "[admin-only-delete] before_tool tool=delete-customer -> block" in out
     assert "[researcher-access] before_tool tool=Researcher -> block" in out
     assert "[search-budget] before_tool tool=web-search -> block" in out
-    assert out.count("status: success") == 5
+    assert out.count("status: success") == 8
+    assert out.count("[refund-approval] before_tool tool=refund-customer -> ask") == 2
+    assert "'outcome': 'approved'" in out and "'outcome': 'declined'" in out
+    assert out.count("[approval asked]") == 2  # none for the admin
     assert out.count("[researcher-access] before_tool tool=Researcher -> block") == 1  # the viewer, not analyst/admin
     assert out.count("[admin-only-delete] before_tool tool=delete-customer -> block") == 2  # viewer and analyst
 
@@ -61,8 +64,25 @@ def test_transform_and_python_hook_example():
     assert "contact her at [EMAIL]" in out
 
 
+def test_inherit_scope_context_example():
+    out = run_example("inherit_scope_context")
+    assert out.count("status: success") == 2
+    assert "[tenant-from-caller] before_tool tool=crm-lookup -> modify" in out
+    assert "[crm-budget] before_tool tool=crm-lookup -> block" in out  # parent and sub-agent share the budget
+    assert "[pii] on_output -> modify" in out
+    for secret in ("ann@leak.example", "zq9boss@leak.example"):
+        assert f"LLM was sent {secret!r}: False" in out
+
+
 @pytest.mark.parametrize(
-    "name", ["pii_mask_restore", "prompt_injection", "tool_policy_subagent", "transform_and_python_hook"]
+    "name",
+    [
+        "pii_mask_restore",
+        "prompt_injection",
+        "tool_policy_subagent",
+        "transform_and_python_hook",
+        "inherit_scope_context",
+    ],
 )
 def test_every_example_ships_its_dag(name):
     assert os.path.isfile(os.path.join(EXAMPLES, name, "dag.yaml"))

@@ -224,3 +224,31 @@ def test_builtin_dump_uses_the_short_type_and_round_trips():
     dumped = hook.model_dump()
     assert dumped["type"] == "call_limit" and dumped["max_per_run"] == 2
     assert resolve_hook(dumped) == hook
+
+
+def test_live_answer_filter_never_sends_a_partial_match_whatever_the_chunking():
+    from dynamiq.nodes.agents.hooks import PIIHook
+
+    hook = PIIHook(live_stream=True, stream_lookback=24)
+    answer = "Write to zq9ann@leak.example or zq9bob@leak.example, call +1 415 555 0100, thanks for waiting."
+    expected = PIIHook().on_output(HookContext(hook_key="k"), answer).value
+    for size in (1, 2, 3, 5, 8, 13, len(answer)):
+        runner = HookRunner([hook])
+        live = runner.live_answer_filter(HookContext())
+        sent = ""
+        for start in range(0, len(answer), size):
+            sent += live.feed(answer[start : start + size])
+            assert "zq9" not in sent and "415 555" not in sent, (size, sent)
+        sent += live.finish()
+        assert sent == expected, size
+
+
+def test_live_answer_filter_exists_only_when_every_answer_hook_can_stream():
+    from dynamiq.nodes.agents.hooks import PIIHook, RegexHook
+
+    ctx = HookContext()
+    live = PIIHook(live_stream=True)
+    assert HookRunner([live]).live_answer_filter(ctx) is not None
+    assert HookRunner([live, Suffix()]).live_answer_filter(ctx) is None  # a Python hook that rewrites the answer
+    assert HookRunner([PIIHook()]).live_answer_filter(ctx) is None  # not opted in
+    assert HookRunner([RegexHook(patterns=["x"], action="block", live_stream=True)]).live_answer_filter(ctx) is None

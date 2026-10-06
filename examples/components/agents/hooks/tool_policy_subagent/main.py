@@ -1,7 +1,8 @@
 """Tool policy example (YAML DAG + tracing): per-user rules, a call budget and a sub-agent as a tool.
 
 Expected: a viewer's delete call and, separately, a viewer's Researcher call are blocked (the sub-agent never
-starts); an analyst may research but not delete; an admin may do both; the third web-search of a run is refused.
+starts); an analyst may research but not delete and needs a human's approval for a refund (a scripted human
+approves one and declines the other); an admin may do all of it; the third web-search of a run is refused.
 Blocks show up as hook events (name, point, decision) in the trace, never as failed tool calls.
 """
 
@@ -25,7 +26,6 @@ DELETE_AND_RESEARCH = "Delete customer 42, then research the history of the Apac
 RESEARCH = "Research the history of the Apache license and summarize it in two sentences."
 BUDGET = "Search the web for three different things: Python, Rust and Go."
 
-# (title, question, metadata, offline script of the parent agent)
 DELETE_THEN_RESEARCH = [
     step_tool("delete-customer", customer_id="42"),
     step_tool("Researcher", input="History of the Apache license"),
@@ -41,17 +41,27 @@ SEARCH_THREE = [
     step_tool("web-search", query="Go"),
     step_final("Searched Python and Rust; the budget stopped the third search."),
 ]
+REFUND = "Refund customer 42 by 20 dollars."
+REFUND_SCRIPT = [
+    step_tool("refund-customer", customer_id="42", amount="20"),
+    step_final("Done. See the tool observation for the outcome of the refund."),
+]
+# (title, question, metadata, parent script, answers of the scripted human to approval questions)
 SCENARIOS = [
     (
         "viewer: delete is refused",
         "Delete customer 42.",
         {"role": "viewer"},
         DELETE_THEN_RESEARCH[:1] + [step_final("An admin must do that.")],
+        [],
     ),
-    ("viewer: the sub-agent call is refused", RESEARCH, {"role": "viewer"}, RESEARCH_ONLY),
-    ("analyst: may research, may not delete", DELETE_AND_RESEARCH, {"role": "analyst"}, DELETE_THEN_RESEARCH),
-    ("admin: may do both", DELETE_AND_RESEARCH, {"role": "admin"}, DELETE_THEN_RESEARCH),
-    ("admin: the third search is over budget", BUDGET, {"role": "admin"}, SEARCH_THREE),
+    ("viewer: the sub-agent call is refused", RESEARCH, {"role": "viewer"}, RESEARCH_ONLY, []),
+    ("analyst: may research, may not delete", DELETE_AND_RESEARCH, {"role": "analyst"}, DELETE_THEN_RESEARCH, []),
+    ("analyst: a refund needs approval, the human approves", REFUND, {"role": "analyst"}, REFUND_SCRIPT, [""]),
+    ("analyst: a refund needs approval, the human declines", REFUND, {"role": "analyst"}, REFUND_SCRIPT, ["too large"]),
+    ("admin: may do both, no approval needed", DELETE_AND_RESEARCH, {"role": "admin"}, DELETE_THEN_RESEARCH, []),
+    ("admin: a refund needs no approval", REFUND, {"role": "admin"}, REFUND_SCRIPT, []),
+    ("admin: the third search is over budget", BUDGET, {"role": "admin"}, SEARCH_THREE, []),
 ]
 CHILD_SCRIPT = [step_final("The Apache License 2.0 was published in 2004 by the ASF.")]
 
@@ -65,10 +75,10 @@ def main():
     if offline:
         print("(offline: scripted LLM)")
 
-    runs = [("Your question", args.question, {"role": "viewer"}, RESEARCH_ONLY)] if args.question else SCENARIOS
-    for title, question, metadata, parent_script in runs:
+    runs = [("Your question", args.question, {"role": "viewer"}, RESEARCH_ONLY, [])] if args.question else SCENARIOS
+    for title, question, metadata, parent_script, answers in runs:
         data = {"input": question, "user_id": "demo-user", "metadata": metadata}
-        with llm_session(offline, {"research sub-agent": CHILD_SCRIPT, "*": parent_script}):
+        with llm_session(offline, {"research sub-agent": CHILD_SCRIPT, "*": parent_script}, answers):
             run_scenario(workflow, agent, title, data, ui=ui)
 
 

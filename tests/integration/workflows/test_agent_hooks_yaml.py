@@ -27,6 +27,7 @@ from dynamiq.nodes.operators.operators import Map
 from dynamiq.nodes.tools.agent_tool import SubAgentTool
 from dynamiq.nodes.tools.python import Python
 from dynamiq.serializers.loaders.yaml import WorkflowYAMLLoader, WorkflowYAMLLoaderException
+from dynamiq.types.feedback import FeedbackMethod
 
 
 class DenyForbidden(Hook):
@@ -40,11 +41,27 @@ class DenyForbidden(Hook):
 
 def make_hooks() -> list[Hook]:
     return [
-        PIIHook(entities=["email", "phone"], on=["input", "tool_result"], restore_in_tools=["python-tool"]),
+        PIIHook(
+            entities=["email", "phone"],
+            on=["input", "tool_result"],
+            restore_in_tools=["python-tool"],
+            scope="request",
+            live_stream=True,
+            inherit=True,
+        ),
         RegexHook(presets=["injection_basic"], on=["input"], on_violation="answer", name="no-injection"),
-        ToolPolicyHook(tools=["python-tool"], allow_if={"metadata.role": ["admin", "ops"]}),
+        ToolPolicyHook(
+            tools=["python-tool"],
+            allow_if={"metadata.role": ["admin", "ops"]},
+            approval=True,
+            approval_unless={"metadata.role": "admin"},
+            feedback_method=FeedbackMethod.STREAM,
+            editable_params=["query"],
+        ),
         CallLimitHook(tools=["python-tool"], max_per_run=3),
-        TransformHook(tools=["python-tool"], input_transformer={"selector": {"mode": "fast"}}),
+        TransformHook(
+            tools=["python-tool"], input_transformer={"selector": {"mode": "fast"}}, from_context={"tenant": "user_id"}
+        ),
         PromptInjectionHook(
             detector={"connection": HuggingFace(id="hf-conn", api_key="k")}, on=["tool_result"], on_violation="fail"
         ),
@@ -185,7 +202,10 @@ def test_a_hand_written_yaml_resolves_the_detector_connection_by_reference(tmp_p
         ("      - patterns: ['x']", "missing `type`"),  # no type
         ("      - type: piii", "Unknown hook type 'piii'"),
         ("      - type: regex\n        patterns: []", "at least one pattern or preset"),
-        ("      - type: tool_policy\n        tools: [x]\n        approval: true", "not supported yet"),
+        (
+            "      - type: tool_policy\n        tools: [x]\n        approval: true\n        aproval_unless: {a: b}",
+            "aproval_unless",
+        ),
     ],
 )
 def test_wrong_hook_config_fails_at_load_time(tmp_path, extra, message):

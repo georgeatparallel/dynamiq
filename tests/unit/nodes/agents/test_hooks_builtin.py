@@ -178,10 +178,10 @@ def test_tool_policy_allow_if_uses_the_run_context():
 
 
 def test_tool_policy_rejects_configs_that_would_allow_everything_and_approval():
-    with pytest.raises(ValidationError, match="needs `deny: true` or `allow_if`"):
+    with pytest.raises(ValidationError, match="needs `deny`, `allow_if` or `approval`"):
         ToolPolicyHook(tools=["x"])
-    with pytest.raises(ValidationError, match="approval.*not supported"):
-        ToolPolicyHook(tools=["x"], approval=True)
+    with pytest.raises(ValidationError, match="approval_unless.*only makes sense"):
+        ToolPolicyHook(tools=["x"], deny=True, approval_unless={"user_id": "u"})
 
 
 def test_call_limit_counts_per_context_and_blocked_calls_do_not_count():
@@ -219,7 +219,7 @@ def test_transform_output_selects_from_json_text_and_serializes_back():
 
 
 def test_transform_validation():
-    with pytest.raises(ValidationError, match="needs an input_transformer"):
+    with pytest.raises(ValidationError, match="needs an input_transformer.selector, `from_context`"):
         TransformHook()
     with pytest.raises(ValidationError, match="input_transformer.path is not supported"):
         TransformHook(input_transformer={"path": "$.a"})
@@ -339,3 +339,11 @@ def test_a_detector_http_error_fails_closed(monkeypatch):
     hook = PromptInjectionHook(detector={"connection": HuggingFace(api_key="k")})
     with pytest.raises(HookStopException):
         HookRunner([hook]).run(HookPoint.ON_INPUT, HookContext(), "hello")
+
+
+def test_transform_sets_arguments_from_the_run_context_overriding_the_model():
+    hook = TransformHook(from_context={"tenant": "metadata.tenant", "user": "user_id", "gone": "metadata.nope"})
+    ctx = HookContext(user_id="u1", metadata={"tenant": "acme"})
+    out = hook.before_tool(ctx, ToolCall(name="crm", input={"tenant": "spoofed", "q": "x"})).value
+    assert out == {"tenant": "acme", "user": "u1", "q": "x"}
+    assert hook.points() == {HookPoint.BEFORE_TOOL}

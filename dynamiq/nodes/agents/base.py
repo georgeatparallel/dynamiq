@@ -4,6 +4,7 @@ import io
 import json
 import mimetypes
 import re
+import threading
 from contextvars import ContextVar
 from copy import deepcopy
 from enum import Enum
@@ -37,11 +38,13 @@ from dynamiq.nodes.agents.exceptions import (
     ToolExecutionException,
 )
 from dynamiq.nodes.agents.hooks import (
+    Ask,
     Hook,
     HookContext,
     HookPoint,
     HookRun,
     HookRunner,
+    LiveAnswerFilter,
     Skip,
     ToolCall,
     ToolResult,
@@ -105,6 +108,7 @@ from dynamiq.storages.file.base import FileStore, FileStoreConfig
 from dynamiq.storages.file.in_memory import InMemoryFileStore
 from dynamiq.storages.memory.base import MemoryStore, MemoryStoreConfig
 from dynamiq.types.cancellation import CanceledException, check_cancellation
+from dynamiq.types.feedback import ApprovalConfig, FeedbackMethod
 from dynamiq.types.streaming import StreamingMode
 from dynamiq.utils.logger import logger
 from dynamiq.utils.utils import TRACING_REDACTED_KEYS, TRACING_REDACTED_PLACEHOLDER, deep_merge
@@ -112,6 +116,9 @@ from dynamiq.utils.utils import TRACING_REDACTED_KEYS, TRACING_REDACTED_PLACEHOL
 # True when an after_model hook changed the LLM reply of the current call, so that streamed chunks do not override it.
 # A ContextVar rather than an Agent attribute: parallel runs of one agent instance must not share it.
 _model_output_rewritten: ContextVar[bool] = ContextVar("dynamiq_agent_model_output_rewritten", default=False)
+
+# One console prompt at a time: parallel tool calls must not interleave their input() calls.
+_console_approval_lock = threading.Lock()
 
 # Per-call tool overlay (e.g. LTM tools bound to a request's user_id); isolated
 # per thread / per asyncio task via ContextVar.
@@ -1738,11 +1745,18 @@ class Agent(AgentIterativeCheckpointMixin, Node):
 
     # --- hooks ------------------------------------------------------------------------------------------------
 
+    def _own_hook_pairs(self) -> list[tuple[str, Hook]]:
+        return [(f"{self.id}:{index}:{hook.display_name}", hook) for index, hook in enumerate(self.hooks)]
+
     def _hook_runner(self) -> HookRunner:
-        return HookRunner(self.hooks)
+        ctx = current_hook_ctx.get()
+        pairs = ctx.hooks if ctx is not None else self._own_hook_pairs()
+        return HookRunner([hook for _, hook in pairs], [key for key, _ in pairs])
 
     def _new_hook_context(self, input_data: AgentInputSchema, metadata: dict, config) -> HookContext:
         """The per-run hook context (one per ``execute``: Map items and sub-agent runs each get their own)."""
+        parent = current_hook_ctx.get()
+        inherited = [(key, hook) for key, hook in parent.hooks if hook.inherit] if parent is not None else []
         ctx = HookContext(
             agent_name=self.name,
             agent_id=self.id,
@@ -1750,7 +1764,10 @@ class Agent(AgentIterativeCheckpointMixin, Node):
             session_id=input_data.session_id,
             metadata=dict(metadata),
             config=config,
+            hooks=[*inherited, *self._own_hook_pairs()],
         )
+        if inherited:
+            ctx.state, ctx.lock = parent.state, parent.lock
         if self._restored_hook_state:
             ctx.state.update(deepcopy(self._restored_hook_state))
             self._restored_hook_state = None
@@ -1778,9 +1795,16 @@ class Agent(AgentIterativeCheckpointMixin, Node):
                         f"which this agent does not have; it will never match."
                     )
 
+    def _live_answer_filter(self) -> LiveAnswerFilter | None:
+        """A filter that masks the answer while it streams, when every hook that touches it can do that."""
+        ctx = current_hook_ctx.get()
+        return self._hook_runner().live_answer_filter(ctx) if ctx is not None else None
+
     def _buffers_final_answer(self) -> bool:
-        """True when a hook may rewrite or veto the answer: it is then streamed once, after the hooks, never live."""
-        return self._hook_runner().has(HookPoint.ON_OUTPUT, HookPoint.AFTER_MODEL)
+        """True when a hook may rewrite or veto the answer and cannot do it while streaming: the answer is then
+        streamed once, after the hooks, never live."""
+        touches_answer = self._hook_runner().has(HookPoint.ON_OUTPUT, HookPoint.AFTER_MODEL)
+        return touches_answer and self._live_answer_filter() is None
 
     @staticmethod
     def _answer_as_text(answer: Any) -> str:
@@ -1826,6 +1850,51 @@ class Agent(AgentIterativeCheckpointMixin, Node):
             config=config,
             **kwargs,
         )
+
+    def _request_tool_approval(
+        self, tool_name: str, tool_input: dict, ask: Ask, hook: Hook, config: RunnableConfig | None, **kwargs
+    ) -> dict:
+        """Ask a human to approve a tool call (``Ask`` from a hook). Returns the input to run the tool with.
+
+        Uses the agent's own approval transport (console, or the agent's input stream). Nothing is stored between
+        calls, so parallel calls of the same tool never share an answer; after a resume the call is asked again.
+        Raises ``ToolBlockedException`` if the human declines or no answer can be obtained (fail closed).
+        """
+        config = ensure_config(config)
+        prompt = ask.prompt or f"Approve calling '{tool_name}' with these arguments?"
+        event = {"hook": hook.display_name, "type": hook.type_name, "point": "before_tool", "decision": "ask"}
+        event["tool"] = tool_name
+        try:
+            if ask.feedback_method == FeedbackMethod.STREAM:
+                approval_config = ApprovalConfig(
+                    enabled=True, feedback_method=FeedbackMethod.STREAM, mutable_data_params=list(ask.editable_params)
+                )
+                answer = self.send_streaming_approval_message(prompt, tool_input, approval_config, config, **kwargs)
+            else:
+                arguments = json.dumps(tool_input, indent=2, ensure_ascii=False, default=str)
+                text = f"{prompt}\n{arguments}\nPress Enter to approve, or type your feedback to decline: "
+                with _console_approval_lock:
+                    answer = self.send_console_approval_message(text, config=config)
+        except (EOFError, ValueError) as e:
+            logger.warning(f"Agent {self.name} - {self.id}: no approval for '{tool_name}' ({type(e).__name__}): {e}")
+            self.run_on_node_execute_run(config.callbacks, hook_events=[{**event, "outcome": "unavailable"}], **kwargs)
+            raise ToolBlockedException(
+                "The call needs a human approval that could not be obtained, so it was not run.",
+                hook=hook.display_name,
+                point=HookPoint.BEFORE_TOOL.value,
+            ) from e
+
+        approved = answer.is_approved if answer.is_approved is not None else answer.feedback == ""
+        edited = {name: answer.data[name] for name in ask.editable_params if name in answer.data}
+        outcome = {"outcome": "approved" if approved else "declined", "edited": sorted(edited)}
+        self.run_on_node_execute_run(config.callbacks, hook_events=[{**event, **outcome}], **kwargs)
+        if not approved:
+            raise ToolBlockedException(
+                "The call was declined by a human" + (f": {answer.feedback}" if answer.feedback else "."),
+                hook=hook.display_name,
+                point=HookPoint.BEFORE_TOOL.value,
+            )
+        return {**tool_input, **edited}
 
     def _apply_input_hooks(self, message: Message | VisionMessage, config, **kwargs) -> Message | VisionMessage:
         """``on_input``: once per run, on the user's message text."""
@@ -2037,6 +2106,10 @@ class Agent(AgentIterativeCheckpointMixin, Node):
                     **kwargs,
                 )
                 merged_input, skipped = hooked.value, hooked.skip
+                if hooked.ask is not None and skipped is None:
+                    merged_input = self._request_tool_approval(
+                        tool.name, merged_input, hooked.ask, hooked.asked_by, config, **kwargs
+                    )
 
             check_cancellation(config)
             # Parked in a delegate call we can't drive the page — hand it to the subagent. Skipped

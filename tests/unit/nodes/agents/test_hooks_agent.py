@@ -1,6 +1,7 @@
 """Hooks inside a real agent loop, in every inference mode."""
 
 import json
+import threading
 from typing import ClassVar
 
 import pytest
@@ -12,6 +13,7 @@ from dynamiq.nodes.agents.hooks import (
     BlockAs,
     CallLimitHook,
     Hook,
+    Modify,
     PIIHook,
     RegexHook,
     Skip,
@@ -25,6 +27,7 @@ from dynamiq.runnables import RunnableConfig, RunnableStatus
 from tests.helpers.agent_hooks import (
     ALL_MODES,
     TOOL_CALLS,
+    EmailTool,
     ExplodingTool,
     SearchTool,
     build_agent,
@@ -342,6 +345,7 @@ def test_a_hook_stop_is_not_retried_even_with_max_retries():
     with scripted(agent, InferenceMode.STRUCTURED_OUTPUT, steps) as recorder:
         result = agent.run(input_data={"input": "go"})
     assert result.status == RunnableStatus.FAILURE
+    assert "Hook 'tool_policy' stopped the run at before_tool: stop" in result.error.message
     assert len(tool_inputs("search")) == 1  # the tool called before the block was not re-run
     assert recorder.calls == 2
 
@@ -529,7 +533,9 @@ def test_the_hook_state_survives_a_checkpoint_and_a_resume():
         question="my mail is ann@x.com",
     )
     hook_state = captured["state"].iteration_data["hook_state"]
-    assert json.loads(json.dumps(hook_state))["hooks"]["0:pii"]["placeholder_to_value"] == {"<EMAIL_1>": "ann@x.com"}
+    assert json.loads(json.dumps(hook_state))["hooks"]["agent:0:pii"]["placeholder_to_value"] == {
+        "<EMAIL_1>": "ann@x.com"
+    }
 
     resumed = build_agent([PIIHook(restore_in_output=True)])
     resumed.restore_iteration_state(captured["state"])
@@ -639,3 +645,302 @@ def test_every_builtin_hook_publishes_a_json_schema_for_ui_forms():
     assert set(schemas) == {"pii", "prompt_injection", "tool_policy", "call_limit", "regex", "transform"}
     assert "restore_in_tools" in schemas["pii"]["properties"] and "max_per_run" in schemas["call_limit"]["properties"]
     assert all(s.get("additionalProperties") is False for s in schemas.values())  # unknown fields are rejected
+
+
+# --- human approval (Ask) ----------------------------------------------------------------------------------------
+
+
+class Approvals:
+    """Scripted human: answers console approval prompts in turn and remembers what it was shown."""
+
+    def __init__(self, *feedback: str):
+        self.feedback = list(feedback)
+        self.shown: list[str] = []
+        self._lock = threading.Lock()
+
+    def __call__(self, template):
+        from dynamiq.types.feedback import ApprovalInputData
+
+        with self._lock:
+            self.shown.append(template)
+            return ApprovalInputData(feedback=self.feedback.pop(0) if self.feedback else "")
+
+
+@pytest.fixture
+def human(monkeypatch):
+    from dynamiq.nodes.agents import Agent
+
+    def install(*feedback):
+        approvals = Approvals(*feedback)
+        monkeypatch.setattr(Agent, "send_console_approval_message", lambda agent, text, config=None: approvals(text))
+        return approvals
+
+    return install
+
+
+def approval_agent(**policy):
+    return build_agent([ToolPolicyHook(tools=["search"], approval=True, **policy)])
+
+
+@modes
+def test_an_approved_call_runs(human, mode):
+    approvals = human("")
+    tracing = TracingCallbackHandler()
+    result, _ = run_scripted(
+        approval_agent(),
+        mode,
+        [tool_step("search", query="a"), final_step("ok")],
+        config=RunnableConfig(callbacks=[tracing]),
+    )
+    assert result.status == RunnableStatus.SUCCESS and tool_inputs("search") == [{"query": "a", "mode": "slow"}]
+    assert "Approve calling 'search'" in approvals.shown[0] and '"query": "a"' in approvals.shown[0]
+    events = [e for run in tracing.runs.values() for e in run.metadata.get("hooks", [])]
+    assert events == [
+        {
+            "hook": "tool_policy",
+            "type": "tool_policy",
+            "point": "before_tool",
+            "decision": "ask",
+            "tool": "search",
+            "outcome": "approved",
+            "edited": [],
+        }
+    ]
+
+
+@modes
+def test_a_declined_call_does_not_run_and_the_model_hears_why(human, mode):
+    human("not now, too risky")
+    result, recorder = run_scripted(approval_agent(), mode, [tool_step("search", query="a"), final_step("ok")])
+    assert result.status == RunnableStatus.SUCCESS and TOOL_CALLS == []
+    assert "declined by a human: not now, too risky" in recorder.sent_text(1)
+
+
+def test_the_human_can_edit_only_the_listed_arguments(monkeypatch):
+    from dynamiq.nodes.agents import Agent
+    from dynamiq.types.feedback import ApprovalInputData, FeedbackMethod
+
+    def stream_answer(self, template, input_data, approval_config, config=None, **kwargs):
+        assert approval_config.mutable_data_params == ["query"]
+        return ApprovalInputData(is_approved=True, data={"query": "edited", "mode": "fast"})
+
+    monkeypatch.setattr(Agent, "send_streaming_approval_message", stream_answer)
+    agent = approval_agent(feedback_method=FeedbackMethod.STREAM, editable_params=["query"])
+    run_scripted(agent, InferenceMode.STRUCTURED_OUTPUT, [tool_step("search", query="a"), final_step("ok")])
+    assert tool_inputs("search") == [{"query": "edited", "mode": "slow"}]
+
+
+def test_approval_unless_skips_the_question_for_matching_users(human):
+    approvals = human("no")
+    agent = approval_agent(approval_unless={"metadata.role": "admin"})
+    steps = [tool_step("search", query="a"), final_step("ok")]
+    run_scripted(agent, InferenceMode.STRUCTURED_OUTPUT, steps, input_extra={"metadata": {"role": "admin"}})
+    assert approvals.shown == [] and len(tool_inputs("search")) == 1
+    run_scripted(
+        approval_agent(approval_unless={"metadata.role": "admin"}),
+        InferenceMode.STRUCTURED_OUTPUT,
+        steps,
+        input_extra={"metadata": {"role": "viewer"}},
+    )
+    assert len(approvals.shown) == 1 and len(tool_inputs("search")) == 1  # asked, declined: no second run
+
+
+def test_the_approval_shows_real_values_while_the_model_only_sees_placeholders(human):
+    approvals = human("")
+    hooks = [
+        PIIHook(restore_in_tools=["send-email"]),
+        ToolPolicyHook(tools=["send-email"], approval=True),
+    ]
+    steps = [tool_step("send-email", to="<EMAIL_1>"), final_step("done")]
+    _, recorder = run_scripted(build_agent(hooks), InferenceMode.STRUCTURED_OUTPUT, steps, question="mail ann@x.com")
+    assert "ann@x.com" in approvals.shown[0]
+    assert "ann@x.com" not in recorder.sent_text() and tool_inputs("send-email") == [{"to": "ann@x.com", "body": ""}]
+
+
+def test_a_later_block_wins_over_an_ask_and_a_skip_wins_too(human):
+    approvals = human("")
+
+    class Deny(Hook):
+        def before_tool(self, ctx, call):
+            return Block("denied")
+
+    class Cache(Hook):
+        def before_tool(self, ctx, call):
+            return Skip("cached")
+
+    steps = [tool_step("search", query="a"), final_step("ok")]
+    _, recorder = run_scripted(
+        build_agent([ToolPolicyHook(approval=True), Deny()]), InferenceMode.STRUCTURED_OUTPUT, steps
+    )
+    assert approvals.shown == [] and "denied" in recorder.sent_text(1)
+    _, recorder = run_scripted(
+        build_agent([ToolPolicyHook(approval=True), Cache()]), InferenceMode.STRUCTURED_OUTPUT, steps
+    )
+    assert approvals.shown == [] and "cached" in recorder.sent_text(1) and TOOL_CALLS == []
+
+
+def test_no_possible_answer_fails_closed(monkeypatch):
+    from dynamiq.nodes.agents import Agent
+
+    def no_terminal(self, template, config=None):
+        raise EOFError
+
+    monkeypatch.setattr(Agent, "send_console_approval_message", no_terminal)
+    _, recorder = run_scripted(
+        approval_agent(), InferenceMode.STRUCTURED_OUTPUT, [tool_step("search", query="a"), final_step("ok")]
+    )
+    assert TOOL_CALLS == [] and "could not be obtained" in recorder.sent_text(1)
+
+
+def test_stream_approval_without_an_input_stream_fails_closed():
+    from dynamiq.types.feedback import FeedbackMethod
+    from dynamiq.types.streaming import StreamingConfig, StreamingMode
+
+    agent = build_agent(
+        [ToolPolicyHook(tools=["search"], approval=True, feedback_method=FeedbackMethod.STREAM)],
+        streaming=StreamingConfig(enabled=True, mode=StreamingMode.FINAL),
+    )
+    with scripted_streaming(agent, InferenceMode.STRUCTURED_OUTPUT, [tool_step("search", query="a"), final_step("ok")]):
+        agent.run(input_data={"input": "go"})
+    assert TOOL_CALLS == []
+
+
+def test_parallel_calls_of_the_same_tool_are_each_asked_and_never_share_an_answer(human):
+    approvals = human("", "no")
+    agent = approval_agent()
+    calls = [("search", {"query": "first"}), ("search", {"query": "second"})]
+    result, _ = run_scripted(agent, InferenceMode.FUNCTION_CALLING, [parallel_step(*calls), final_step("ok")])
+    assert result.status == RunnableStatus.SUCCESS
+    assert len(approvals.shown) == 2 and len(tool_inputs("search")) == 1
+
+
+# --- inherit -----------------------------------------------------------------------------------------------------
+
+
+def parent_with_child(hooks, child_hooks=()):
+    child = build_agent(list(child_hooks), tools=[], name="Researcher", id="child")
+    parent = build_agent(
+        hooks, tools=[SubAgentTool(agent=child, name="Researcher", description="researches")], delegation_allowed=True
+    )
+    return parent, child
+
+
+@modes
+def test_an_inheriting_hook_also_runs_in_the_sub_agent(mode):
+    mask = dict(patterns=[r"SECRET\d+"], action="mask", on=["output"])
+    steps = [tool_step("Researcher", input="q"), final_step("ok")]
+
+    parent, child = parent_with_child([RegexHook(**mask, inherit=True)])
+    with scripted(child, mode, [final_step("found SECRET999")]):
+        _, recorder = run_scripted(parent, mode, steps)
+    assert "SECRET999" not in recorder.sent_text() and "found [REDACTED]" in recorder.sent_text(1)
+
+    parent, child = parent_with_child([RegexHook(**mask)])
+    with scripted(child, mode, [final_step("found SECRET999")]):
+        _, recorder = run_scripted(parent, mode, steps)
+    assert "found SECRET999" in recorder.sent_text(1)  # without `inherit` the child is untouched
+
+
+def test_the_sub_agent_shares_the_run_state_so_placeholder_numbering_continues():
+    parent, child = parent_with_child([PIIHook(inherit=True)])
+    steps = [tool_step("Researcher", input="ask bob@y.com about it"), final_step("ok")]
+    with scripted(child, InferenceMode.STRUCTURED_OUTPUT, [final_step("done")]) as child_rec:
+        run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, steps, question="mail ann@x.com")
+    assert "<EMAIL_2>" in child_rec.sent_text(0) and "bob@y.com" not in child_rec.sent_text(0)
+
+
+def test_a_call_limit_with_inherit_counts_the_parents_and_the_sub_agents_calls_together():
+    parent, child = parent_with_child([CallLimitHook(tools=["search"], max_per_run=1, inherit=True)])
+    parent.tools.append(SearchTool())
+    child.tools = [SearchTool()]
+    steps = [tool_step("search", query="parent"), tool_step("Researcher", input="q"), final_step("ok")]
+    with scripted(child, InferenceMode.STRUCTURED_OUTPUT, [tool_step("search", query="child"), final_step("done")]):
+        run_scripted(parent, InferenceMode.STRUCTURED_OUTPUT, steps)
+    assert [args["query"] for args in tool_inputs("search")] == ["parent"]
+
+
+# --- pii scope ---------------------------------------------------------------------------------------------------
+
+
+@modes
+def test_pii_scope_request_masks_only_what_each_llm_call_is_sent(mode):
+    from dynamiq.memory import Memory
+    from dynamiq.memory.backends import InMemory
+
+    memory = Memory(backend=InMemory())
+    agent = build_agent(
+        [PIIHook(scope="request", restore_in_tools=["send-email"])],
+        tools=[SearchTool(result="owner: boss@corp.com"), EmailTool()],
+        memory=memory,
+    )
+    steps = [
+        tool_step("search", query="owner"),
+        tool_step("send-email", to="<EMAIL_1>"),
+        final_step("sent to <EMAIL_1>"),
+    ]
+    result, recorder = run_scripted(
+        agent, mode, steps, question="mail ann@x.com", input_extra={"user_id": "u", "session_id": "s"}
+    )
+    assert result.status == RunnableStatus.SUCCESS
+    assert "ann@x.com" not in recorder.sent_text() and "boss@corp.com" not in recorder.sent_text()
+    assert tool_inputs("send-email") == [{"to": "ann@x.com", "body": ""}]
+    history = str([m.content for m in agent._prompt.messages])
+    assert "ann@x.com" in history and "boss@corp.com" in history  # the history keeps what was really said
+    assert "ann@x.com" in " ".join(str(m.content) for m in memory.get_all())
+
+
+def test_pii_scope_request_only_applies_to_masking_and_needs_no_input_or_tool_result_hooks():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="only applies to `action: mask`"):
+        PIIHook(scope="request", action="block")
+    from dynamiq.nodes.agents.hooks import HookPoint
+
+    assert PIIHook(scope="request").points() == {HookPoint.BEFORE_MODEL, HookPoint.ON_OUTPUT}
+
+
+# --- live streaming of a masked answer -------------------------------------------------------------------------
+
+
+@modes
+def test_a_live_masking_hook_streams_the_answer_while_it_is_generated_and_never_leaks(mode):
+    from dynamiq.types.streaming import StreamingConfig, StreamingMode
+
+    answer = "Your contact zq9ann@leak.example is on file, and zq9bob@leak.example is the billing contact on record."
+    hooks = [PIIHook(on=["output"], live_stream=True, stream_lookback=24)]
+    agent = build_agent(hooks, streaming=StreamingConfig(enabled=True, mode=StreamingMode.FINAL))
+    with scripted_streaming(agent, mode, [final_step(answer)]) as (_, streamed):
+        result = agent.run(input_data={"input": "hi"})
+    chunks = [content for step, content in streamed if step == "answer"]
+    assert (
+        result.output["content"] == "Your contact <EMAIL_1> is on file, and <EMAIL_2> is the billing contact on record."
+    )
+    assert "".join(chunks) == result.output["content"]
+    assert len(chunks) > 1  # streamed as it came, not once at the end
+    assert "zq9" not in "".join(chunks)
+
+
+def test_a_non_streamable_answer_hook_keeps_the_answer_buffered_even_if_another_streams():
+    from dynamiq.types.streaming import StreamingConfig, StreamingMode
+
+    class Rewrite(Hook):
+        def on_output(self, ctx, answer):
+            return Modify(answer.upper())
+
+    hooks = [PIIHook(on=["output"], live_stream=True), Rewrite()]
+    agent = build_agent(hooks, streaming=StreamingConfig(enabled=True, mode=StreamingMode.FINAL))
+    with scripted_streaming(agent, InferenceMode.STRUCTURED_OUTPUT, [final_step("plain text answer")]) as (_, streamed):
+        result = agent.run(input_data={"input": "hi"})
+    assert [c for s, c in streamed if s == "answer"] == [result.output["content"]] == ["PLAIN TEXT ANSWER"]
+
+
+@modes
+def test_from_context_sets_what_the_model_must_not_choose_even_against_tool_params(mode):
+    agent = build_agent([TransformHook(tools=["search"], from_context={"mode": "metadata.tenant"})])
+    run_scripted(
+        agent,
+        mode,
+        [tool_step("search", query="x", mode="spoofed"), final_step("ok")],
+        input_extra={"metadata": {"tenant": "acme"}, "tool_params": {"by_name": {"search": {"mode": "from-params"}}}},
+    )
+    assert tool_inputs("search") == [{"query": "x", "mode": "acme"}]
